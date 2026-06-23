@@ -46,6 +46,9 @@ uniform float u_split;       // split-view: x-позиция (0..1) или <0 е
 uniform float u_lumaShift;   // сдвиг яркости к тону цели (0 — сохранять L, 1 — сильно)
 uniform sampler2D u_lut;     // LUT-атлас: x=яркость волоса, y=оттенок
 uniform float u_lutRow;      // v-координата строки оттенка (0..1); <0 — использовать HSL
+uniform float u_colorSharp;  // резкость веса по цвету в joint-bilateral (этап 3)
+uniform float u_edgeLow;     // нижний край финального smoothstep-ремапа маски
+uniform float u_edgeHigh;    // верхний край финального smoothstep-ремапа маски
 
 // ---- RGB <-> HSL (стандартные) ----
 vec3 rgb2hsl(vec3 c) {
@@ -86,24 +89,27 @@ vec3 hsl2rgb(vec3 hsl) {
   );
 }
 
-// Guided feathering (этап 2, вариант «лучше» из брифа): joint-bilateral —
-// уточняем низкоразрешённую (256) маску по ПОЛНОразрешённому видеокадру как гайду.
-// Каждый сосед взвешиваем (а) пространственно и (б) по СХОДСТВУ ЦВЕТА с центром.
-// Так край маски «прилипает» к границе волос/кожи и идёт вдоль прядей, а не
-// обрезан по грубой сетке 256. Один проход, без доп. фреймбуферов.
+// Joint-bilateral matting-апсемпл (этап 3): уточняем низкоразрешённую (256)
+// МЯГКУЮ маску по ПОЛНОразрешённому видеокадру как гайду. Каждый сосед
+// взвешиваем (а) пространственно и (б) по СХОДСТВУ ЦВЕТА с центром. С мягкой
+// (confidence) маской и резким цветовым весом край «прилипает» к реальному
+// переходу волосы→кожа и идёт вдоль прядей: hair-цветные соседи тянут маску
+// вверх на волосах, кожа-цветные исключаются на коже. 5x5 для плавности края,
+// один проход без доп. фреймбуферов.
 float guidedMask(vec2 uv, vec3 centerColor) {
   if (u_feather <= 0.01) return texture(u_mask, uv).r;
-  vec2 step = u_maskTexel * u_feather * 1.4; // шире шаг — 3x3 покрывает прежнюю зону
+  vec2 step = u_maskTexel * u_feather;
   float sum = 0.0;
   float wsum = 0.0;
-  for (int y = -1; y <= 1; y++) {
-    for (int x = -1; x <= 1; x++) {
+  for (int y = -2; y <= 2; y++) {
+    for (int x = -2; x <= 2; x++) {
       vec2 o = vec2(float(x), float(y)) * step;
       float m = texture(u_mask, uv + o).r;
       vec3 c = texture(u_video, uv + o).rgb;
       vec3 d = c - centerColor;
-      float wColor = exp(-dot(d, d) * 22.0);          // близкий цвет -> больше вес
-      float wSpace = exp(-float(x * x + y * y) * 0.5);  // ближе -> больше вес
+      // Резкий вес по цвету: граница тянется по реальному переходу, кожа отсекается.
+      float wColor = exp(-dot(d, d) * u_colorSharp);
+      float wSpace = exp(-float(x * x + y * y) * 0.30); // ближе -> больше вес
       float w = wColor * wSpace;
       sum += m * w;
       wsum += w;
@@ -118,8 +124,9 @@ void main() {
   vec2 sampleUv = vec2(mix(uv.x, 1.0 - uv.x, u_mirror), uv.y);
 
   vec3 orig = texture(u_video, sampleUv).rgb;
-  // Guided feathering + лёгкий ремап края внутрь, чтобы цвет не выползал на кожу.
-  float mask = smoothstep(0.4, 0.82, guidedMask(sampleUv, orig));
+  // Matting-апсемпл + ремап края: центр волос→1, кожа→0, граница≈0.5 (сдвиг чуть
+  // выше 0.5, чтобы цвет не выползал на кожу, но мягкость прядей сохранялась).
+  float mask = smoothstep(u_edgeLow, u_edgeHigh, guidedMask(sampleUv, orig));
 
   vec3 recolored;
   if (u_lutRow >= 0.0) {

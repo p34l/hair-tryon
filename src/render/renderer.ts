@@ -9,7 +9,10 @@
 
 import { createGLContext, createProgram, createTexture } from './glContext';
 import { VERTEX_SHADER, FRAGMENT_SHADER } from './recolorShader';
-import { INFERENCE_SIZE, FEATHER_RADIUS, LUMA_SHIFT, LUT } from '../config';
+import {
+  INFERENCE_SIZE, FEATHER_RADIUS, LUMA_SHIFT, LUT, MAX_RENDER_HEIGHT,
+  GUIDED_COLOR_SHARP, MASK_EDGE_LOW, MASK_EDGE_HIGH,
+} from '../config';
 import type { RGB } from '../types';
 
 export class Renderer {
@@ -32,6 +35,9 @@ export class Renderer {
   private uLumaShift: WebGLUniformLocation;
   private uLut: WebGLUniformLocation;
   private uLutRow: WebGLUniformLocation;
+  private uColorSharp: WebGLUniformLocation;
+  private uEdgeLow: WebGLUniformLocation;
+  private uEdgeHigh: WebGLUniformLocation;
   private lutTex: WebGLTexture;
   private lutReady = false;
   private lutRow = -1.0; // строка текущего оттенка в LUT (0..1); <0 — HSL-фолбэк
@@ -43,6 +49,14 @@ export class Renderer {
   private mirror = 1.0;
   private split = -1.0; // split-view выключен по умолчанию
   private maskReady = false;
+
+  // Размеры уже выделенного storage текстур (этап 4). Storage аллоцируем один
+  // раз через texImage2D, дальше обновляем содержимое через texSubImage2D —
+  // переаллокация на каждый кадр (особенно 1080p видео) бьёт по FPS.
+  private videoTexW = 0;
+  private videoTexH = 0;
+  private maskTexW = INFERENCE_SIZE;
+  private maskTexH = INFERENCE_SIZE;
 
   constructor(canvas: HTMLCanvasElement) {
     const gl = createGLContext(canvas);
@@ -61,6 +75,9 @@ export class Renderer {
     this.uLumaShift = gl.getUniformLocation(this.program, 'u_lumaShift')!;
     this.uLut = gl.getUniformLocation(this.program, 'u_lut')!;
     this.uLutRow = gl.getUniformLocation(this.program, 'u_lutRow')!;
+    this.uColorSharp = gl.getUniformLocation(this.program, 'u_colorSharp')!;
+    this.uEdgeLow = gl.getUniformLocation(this.program, 'u_edgeLow')!;
+    this.uEdgeHigh = gl.getUniformLocation(this.program, 'u_edgeHigh')!;
 
     this.videoTex = createTexture(gl);
     this.maskTex = createTexture(gl);
@@ -117,10 +134,21 @@ export class Renderer {
     const gl = this.gl;
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.bindTexture(gl.TEXTURE_2D, this.maskTex);
-    gl.texImage2D(
-      gl.TEXTURE_2D, 0, gl.R8, width, height, 0,
-      gl.RED, gl.UNSIGNED_BYTE, data,
-    );
+    if (width !== this.maskTexW || height !== this.maskTexH) {
+      // Размер изменился (или первый кадр) — (пере)аллоцируем storage.
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.R8, width, height, 0,
+        gl.RED, gl.UNSIGNED_BYTE, data,
+      );
+      this.maskTexW = width;
+      this.maskTexH = height;
+    } else {
+      // Storage уже есть — обновляем содержимое без переаллокации.
+      gl.texSubImage2D(
+        gl.TEXTURE_2D, 0, 0, 0, width, height,
+        gl.RED, gl.UNSIGNED_BYTE, data,
+      );
+    }
     this.maskReady = true;
   }
 
@@ -133,17 +161,35 @@ export class Renderer {
     const h = v.videoHeight || i.naturalHeight || 0;
     if (!w || !h) return;
 
-    // Canvas совпадает по размеру с видео (CSS подгоняет под экран).
-    if (gl.canvas.width !== w || gl.canvas.height !== h) {
-      gl.canvas.width = w;
-      gl.canvas.height = h;
-    }
-    gl.viewport(0, 0, w, h);
+    // Рендер-таргет держим в АСПЕКТЕ видео (sampleUv 0..1 натянут на весь канвас,
+    // иной аспект растянул бы картинку), но кэпим разрешение под фактический
+    // размер вывода × DPR с потолком по высоте — иначе шейдер зря считает
+    // per-pixel на полном 1080p (этап 5).
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const cssH = (gl.canvas as HTMLCanvasElement).clientHeight || h;
+    // целевая высота буфера: по CSS-высоте × DPR, но не больше видео и не больше потолка
+    let targetH = Math.round(cssH * dpr) || h;
+    targetH = Math.min(targetH, h, MAX_RENDER_HEIGHT);
+    if (targetH < 1) targetH = h;
+    const targetW = Math.max(1, Math.round(w * (targetH / h)));
 
-    // Текстура видео из текущего кадра.
+    if (gl.canvas.width !== targetW || gl.canvas.height !== targetH) {
+      gl.canvas.width = targetW;
+      gl.canvas.height = targetH;
+    }
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+
+    // Текстура видео из текущего кадра. Storage аллоцируем один раз (или при
+    // смене размера источника), дальше — texSubImage2D без переаллокации.
     gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    if (w !== this.videoTexW || h !== this.videoTexH) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+      this.videoTexW = w;
+      this.videoTexH = h;
+    } else {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    }
 
     gl.useProgram(this.program);
     gl.bindVertexArray(this.vao);
@@ -170,6 +216,9 @@ export class Renderer {
     gl.uniform1f(this.uFeather, FEATHER_RADIUS);
     gl.uniform1f(this.uSplit, this.split);
     gl.uniform1f(this.uLumaShift, LUMA_SHIFT);
+    gl.uniform1f(this.uColorSharp, GUIDED_COLOR_SHARP);
+    gl.uniform1f(this.uEdgeLow, MASK_EDGE_LOW);
+    gl.uniform1f(this.uEdgeHigh, MASK_EDGE_HIGH);
 
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }

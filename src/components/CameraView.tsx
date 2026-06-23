@@ -262,7 +262,6 @@ export function CameraView() {
     let frameCount = 0;
     let fpsT0 = performance.now();
     let tick = 0;
-    let faceTick = 0; // монотонный timestamp для FaceLandmarker
 
     const isUsable = (s: HTMLVideoElement | HTMLImageElement) => {
       const v = s as HTMLVideoElement;
@@ -309,26 +308,11 @@ export function CameraView() {
       renderer.render(src);
       void sendToWorker(src);
 
-      // Этап 1: пересчитываем exclusion-маску бороды через кадр (детект на
-      // главном потоке — дорого делать каждый кадр). detectForVideo синхронный.
-      const fb = faceBuilderRef.current;
-      if (fb && frameCount % 3 === 0) {
-        try {
-          const ex = fb.buildJawExclusion(src, faceTick++ * 40);
-          exclusionRef.current = ex;
-          // [debug] раз в ~30 кадров: есть ли лицо и сколько пикселей в маске бороды
-          if ((frameCount % 30) === 0) {
-            let px = 0;
-            if (ex) for (let i = 0; i < ex.length; i++) if (ex[i] > 0) px++;
-            (window as any).__face = { stage: 'detect', face: !!ex, beardPx: px };
-          }
-        } catch (e) {
-          exclusionRef.current = null;
-          (window as any).__face = { stage: 'detect-error', error: String(e) };
-        }
-      }
+      // Этап 1 (exclusion-маска бороды) теперь считается в ОТДЕЛЬНОМ цикле через
+      // requestIdleCallback (см. эффект ниже) — detectForVideo синхронный и тяжёлый,
+      // в рендер-кадре он блокировал отрисовку. Здесь только сам рендер.
 
-      frameCount++; // также троттлит детект бороды (каждый 2-й кадр)
+      frameCount++;
       const now = performance.now();
       if (now - fpsT0 >= 1000) {
         setFps(Math.round((frameCount * 1000) / (now - fpsT0)));
@@ -357,6 +341,70 @@ export function CameraView() {
     return () => {
       cancelled = true;
       cancelAnimationFrame(raf);
+    };
+  }, []);
+
+  // --- Этап 6: exclusion-маска бороды в отдельном цикле (вне рендер-кадра). ---
+  // detectForVideo синхронный и тяжёлый — раньше он крутился внутри rVFC-колбэка
+  // и блокировал drawArrays. Выносим в requestIdleCallback (фолбэк setTimeout) и
+  // троттлим до ~6 раз/сек: борода двигается медленно, чаще не нужно, а рендер
+  // больше не ждёт инференс лэндмарков.
+  useEffect(() => {
+    const video = videoRef.current!;
+    let cancelled = false;
+    let faceTick = 0;
+    let lastRun = 0;
+    let idleHandle = 0;
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    const MIN_INTERVAL = 160; // мс между детектами (~6 раз/сек)
+    const hasIdle = typeof (window as any).requestIdleCallback === 'function';
+
+    const isUsable = (s: HTMLVideoElement | HTMLImageElement) => {
+      const v = s as HTMLVideoElement;
+      const i = s as HTMLImageElement;
+      if (v.tagName === 'VIDEO') return v.readyState >= 2 && v.videoWidth > 0;
+      return i.complete && i.naturalWidth > 0;
+    };
+    const pickSource = (): HTMLVideoElement | HTMLImageElement =>
+      modeRef.current === 'image' && imgRef.current?.complete ? imgRef.current : video;
+
+    const runDetect = () => {
+      if (cancelled) return;
+      const now = performance.now();
+      const fb = faceBuilderRef.current;
+      const src = pickSource();
+      if (fb && src && isUsable(src) && now - lastRun >= MIN_INTERVAL) {
+        lastRun = now;
+        try {
+          const ex = fb.buildJawExclusion(src, faceTick++ * 40);
+          exclusionRef.current = ex;
+          let px = 0;
+          if (ex) for (let k = 0; k < ex.length; k++) if (ex[k] > 0) px++;
+          (window as any).__face = { stage: 'detect', face: !!ex, beardPx: px };
+        } catch (e) {
+          exclusionRef.current = null;
+          (window as any).__face = { stage: 'detect-error', error: String(e) };
+        }
+      }
+      schedule();
+    };
+
+    const schedule = () => {
+      if (cancelled) return;
+      if (hasIdle) {
+        idleHandle = (window as any).requestIdleCallback(runDetect, { timeout: 250 });
+      } else {
+        timeoutHandle = setTimeout(runDetect, MIN_INTERVAL);
+      }
+    };
+    schedule();
+
+    return () => {
+      cancelled = true;
+      if (hasIdle && idleHandle && typeof (window as any).cancelIdleCallback === 'function') {
+        (window as any).cancelIdleCallback(idleHandle);
+      }
+      if (timeoutHandle) clearTimeout(timeoutHandle);
     };
   }, []);
 

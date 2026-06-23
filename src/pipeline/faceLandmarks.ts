@@ -32,6 +32,8 @@ export class FaceMaskBuilder {
   private canvas = new OffscreenCanvas(INFERENCE_SIZE, INFERENCE_SIZE);
   private ctx = this.canvas.getContext('2d', { willReadFrequently: true })!;
   private exclusion = new Uint8Array(INFERENCE_SIZE * INFERENCE_SIZE);
+  // Последний timestamp detectForVideo (VIDEO-режим требует возрастающих меток).
+  private lastTs = -1;
 
   get ready() {
     return this.landmarker !== null;
@@ -55,6 +57,21 @@ export class FaceMaskBuilder {
         numFaces: 1,
       });
     }
+    // Прогрев на холостом кадре: первый detectForVideo компилирует GPU-кернелы.
+    // Делаем на экране загрузки, чтобы при старте не было ривка на первом детекте.
+    this.warmup();
+  }
+
+  /** Прогон по пустому кадру, чтобы скомпилировать кернелы заранее. */
+  private warmup() {
+    if (!this.landmarker) return;
+    try {
+      this.ctx.clearRect(0, 0, INFERENCE_SIZE, INFERENCE_SIZE);
+      this.lastTs = 0;
+      this.landmarker.detectForVideo(this.canvas, this.lastTs);
+    } catch {
+      /* прогрев необязателен — игнорируем сбой */
+    }
   }
 
   /**
@@ -75,7 +92,11 @@ export class FaceMaskBuilder {
     // Источник растягивается в квадрат так же, как кадр для сегментации волос,
     // поэтому маски совпадают.
     ctx.drawImage(source, 0, 0, S, S);
-    const result = this.landmarker.detectForVideo(this.canvas, timestamp);
+    // Строго возрастающий timestamp (после прогрева lastTs уже = 0).
+    let ts = timestamp;
+    if (ts <= this.lastTs) ts = this.lastTs + 1;
+    this.lastTs = ts;
+    const result = this.landmarker.detectForVideo(this.canvas, ts);
     const faces = result.faceLandmarks;
     if (!faces || faces.length === 0) return null;
 

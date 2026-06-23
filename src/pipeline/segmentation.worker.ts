@@ -41,6 +41,9 @@
   const offCtx = offscreen.getContext('2d', { willReadFrequently: true })!;
 
   let maskBuffer = new Uint8Array(INFERENCE_SIZE * INFERENCE_SIZE);
+  // Последний использованный timestamp segmentForVideo (VIDEO-режим требует
+  // строго возрастающих меток). Прогрев занимает 0, реальные кадры идут дальше.
+  let lastTs = -1;
 
   function post(msg: any, transfer?: Transferable[]) {
     (self as any).postMessage(msg, transfer ?? []);
@@ -52,12 +55,40 @@
       segmenter = await ImageSegmenter.createFromOptions(fileset, {
         baseOptions: { modelAssetPath: modelPath, delegate: 'GPU' },
         runningMode: 'VIDEO',
+        // Этап 1: мягкая (confidence) маска — главный источник «кипения» края.
+        // Берём вероятность класса hair как есть (0..1 -> 0..255), без бинарного
+        // порога: переходы волосы/фон становятся плавными, а EMA/feather дальше
+        // их докручивают. categoryMask держим фолбэком (старая бинарная логика).
         outputCategoryMask: true,
-        outputConfidenceMasks: false,
+        outputConfidenceMasks: true,
       });
-      post({ type: 'ready' });
+      // Прогрев на холостом кадре: ПЕРВЫЙ инференс компилирует GPU-кернелы —
+      // делаем это сейчас, на экране загрузки, чтобы при старте камеры не было
+      // лага. 'ready' шлём только после прогрева (с подстраховкой по таймауту).
+      warmupThenReady();
     } catch (err) {
       post({ type: 'error', message: String(err) });
+    }
+  }
+
+  function warmupThenReady() {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      post({ type: 'ready' });
+    };
+    try {
+      offCtx.clearRect(0, 0, INFERENCE_SIZE, INFERENCE_SIZE);
+      lastTs = 0;
+      segmenter.segmentForVideo(offscreen, lastTs, (result: any) => {
+        result.close?.();
+        finish();
+      });
+      // если колбэк не пришёл (маловероятно) — всё равно отдаём готовность
+      setTimeout(finish, 2500);
+    } catch {
+      finish();
     }
   }
 
@@ -69,18 +100,42 @@
     offCtx.drawImage(bitmap, 0, 0, INFERENCE_SIZE, INFERENCE_SIZE);
     bitmap.close();
 
+    // Гарантируем строго возрастающий timestamp (после прогрева и в принципе).
+    let ts = timestamp;
+    if (ts <= lastTs) ts = lastTs + 1;
+    lastTs = ts;
+
     try {
-      segmenter.segmentForVideo(offscreen, timestamp, (result: any) => {
-        const categoryMask = result.categoryMask;
-        if (!categoryMask) return;
-        const src: Uint8Array = categoryMask.getAsUint8Array();
+      segmenter.segmentForVideo(offscreen, ts, (result: any) => {
+        // Предпочитаем мягкую confidence-маску класса hair: вероятность 0..1
+        // без порога. Это убирает бинарное «мерцание» на границе прядей.
+        const confMasks = result.confidenceMasks;
+        const hairConf = confMasks && confMasks[HAIR_CLASS];
+        let wrote = false;
 
-        if (maskBuffer.length !== src.length) maskBuffer = new Uint8Array(src.length);
-        for (let i = 0; i < src.length; i++) {
-          maskBuffer[i] = src[i] === HAIR_CLASS ? 255 : 0;
+        if (hairConf) {
+          const probs: Float32Array = hairConf.getAsFloat32Array();
+          if (maskBuffer.length !== probs.length) maskBuffer = new Uint8Array(probs.length);
+          for (let i = 0; i < probs.length; i++) {
+            // clamp(p*255, 0, 255) — мягкая запись без бинаризации.
+            const v = probs[i] * 255.0;
+            maskBuffer[i] = v < 0 ? 0 : v > 255 ? 255 : v;
+          }
+          wrote = true;
+        } else if (result.categoryMask) {
+          // Фолбэк: старая бинарная логика из категориальной маски.
+          const src: Uint8Array = result.categoryMask.getAsUint8Array();
+          if (maskBuffer.length !== src.length) maskBuffer = new Uint8Array(src.length);
+          for (let i = 0; i < src.length; i++) {
+            maskBuffer[i] = src[i] === HAIR_CLASS ? 255 : 0;
+          }
+          wrote = true;
         }
-        categoryMask.close();
 
+        // Освобождаем нативные буферы результата (масок + сам результат).
+        result.close?.();
+
+        if (!wrote) return;
         const out = maskBuffer.slice();
         post({ type: 'mask', data: out, width: INFERENCE_SIZE, height: INFERENCE_SIZE }, [out.buffer]);
       });
