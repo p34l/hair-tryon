@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <title>Hair Try-On PoC</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      /* убираем мобильную подсветку тапа («тёмные рамки») и фокус-обводку кнопок */
+      button, label, .swatch {
+        -webkit-tap-highlight-color: transparent;
+        -webkit-touch-callout: none;
+        user-select: none;
+      }
+      button:focus, button:focus-visible { outline: none; }
+      html,
+      body,
+      #root {
+        margin: 0;
+        height: 100%;
+        width: 100%;
+        background: #000;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        overscroll-behavior: none;
+      }
+
+      /* ---- Layout ---- */
+      .camera-view {
+        position: relative;
+        height: 100%;
+        width: 100%;
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #fff;
+      }
+      .hidden-source {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+        pointer-events: none;
+      }
+      /* Сцена: ограниченная по ширине вертикальная «карточка» как в референсе.
+         Внутри — canvas + все оверлеи (позиционируются относительно неё). */
+      .stage {
+        position: relative;
+        height: 100%;
+        aspect-ratio: 9 / 16;   /* форма телефона; на мобиле упрётся в ширину = фуллскрин */
+        max-width: min(430px, 100%); /* уже карточка -> в палитру влезает ~5 сватчей */
+        overflow: hidden;
+        background: #000;
+        border-radius: 22px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 0 40px rgba(0, 0, 0, 0.5);
+      }
+      /* на мобиле — без скруглений и теней, во весь экран */
+      @media (max-aspect-ratio: 9 / 16) {
+        .stage { border-radius: 0; box-shadow: none; }
+      }
+      .output-canvas {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+
+      /* ---- Branding ---- */
+      .brand {
+        position: absolute;
+        top: 14px;
+        right: 18px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 3px;
+        font-family: Georgia, 'Times New Roman', serif;
+        font-size: 15px;
+        color: #111;
+        letter-spacing: 0.5px;
+      }
+      .brand-logo { height: 34px; width: auto; }
+
+      /* ---- Loading screen ---- */
+      .loading-screen {
+        position: absolute;
+        inset: 0;
+        z-index: 50;
+        background: #fff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        animation: fadeIn 0.3s ease;
+      }
+      @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+      .loading-logo {
+        height: 150px;
+        width: auto; /* реальная gif-анимация загрузки, анимируется сама */
+      }
+      .loading-center {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 26px;
+      }
+      .loading-hint {
+        color: #888;
+        font-size: 14px;
+        letter-spacing: 1px;
+      }
+      .loading-actions {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 12px;
+      }
+      .start-btn {
+        border: none;
+        background: #111;
+        color: #fff;
+        font-size: 16px;
+        font-weight: 700;
+        padding: 14px 36px;
+        border-radius: 30px;
+        cursor: pointer;
+      }
+      .start-btn:active { transform: scale(0.97); }
+      .start-upload {
+        color: #555;
+        font-size: 13px;
+        text-decoration: underline;
+        cursor: pointer;
+      }
+
+      /* ---- Disclaimer ---- */
+      .disclaimer {
+        position: absolute;
+        top: 16px;
+        left: 50%;
+        width: calc(100% - 24px);
+        max-width: 520px;
+        display: flex;
+        align-items: flex-start;
+        gap: 14px;
+        background: rgba(245, 245, 245, 0.98);
+        color: #1a1a1a;
+        border-radius: 14px;
+        padding: 14px 44px 14px 16px;
+        font-size: 14.5px;
+        line-height: 1.4;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+        transform: translateX(-50%);
+        animation: disclaimerIn 0.4s ease-out both;
+      }
+      @keyframes disclaimerIn {
+        from { opacity: 0; transform: translate(-50%, -14px); }
+        to   { opacity: 1; transform: translate(-50%, 0); }
+      }
+      /* Уходит вверх с затуханием, когда появляется запрос камеры (ready). */
+      .disclaimer.leaving {
+        opacity: 0;
+        transform: translate(-50%, -14px);
+        transition: opacity 0.35s ease, transform 0.35s ease;
+        animation: none;
+        pointer-events: none;
+      }
+      .disclaimer-logo { height: 38px; width: auto; flex-shrink: 0; }
+      .disclaimer strong { display: block; margin-bottom: 2px; }
+      .disclaimer-close {
+        position: absolute;
+        top: 8px;
+        right: 10px;
+        border: none;
+        background: none;
+        font-size: 20px;
+        cursor: pointer;
+        color: #1a1a1a;
+      }
+
+      /* ---- Camera popup (нет доступа к камере) ---- */
+      .camera-popup {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        right: 12px;
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        background: rgba(245, 245, 245, 0.98);
+        color: #1a1a1a;
+        border-radius: 12px;
+        padding: 12px 38px 12px 14px;
+        font-size: 13px;
+        line-height: 1.4;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+        z-index: 20;
+      }
+      .camera-popup-close {
+        position: absolute;
+        top: 8px;
+        right: 10px;
+        border: none;
+        background: none;
+        font-size: 20px;
+        cursor: pointer;
+        color: #1a1a1a;
+      }
+
+      /* ---- Left rail ---- */
+      .left-rail {
+        position: absolute;
+        left: 16px;
+        top: 50%;
+        transform: translateY(-50%);
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        align-items: center;
+      }
+      /* ---- Liquid-glass стиль кнопок (iOS-26) ---- */
+      .rail-btn,
+      .capture-btn,
+      .intensity-toggle,
+      .product-card,
+      .swatch-swiper {
+        background: rgba(255, 255, 255, 0.14);
+        backdrop-filter: blur(22px) saturate(160%);
+        -webkit-backdrop-filter: blur(22px) saturate(160%);
+        border: 1px solid rgba(255, 255, 255, 0.22);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 6px 18px rgba(0, 0, 0, 0.22);
+      }
+      /* Карусель сватчей (Swiper): ~5 в кадре, центральный — выбранный. */
+      .swatch-swiper {
+        border-radius: 38px;
+        padding: 10px 0;
+        overflow: hidden;
+        height: 72px;
+        width: 100%;
+        max-width: 100%;
+        box-sizing: border-box;
+      }
+      .swatch-swiper .swiper-slide {
+        width: 52px; /* slidesPerView="auto" — ширина по сватчу, не на весь экран */
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .right-rail {
+        position: absolute;
+        right: 16px;
+        top: 50%;
+        transform: translateY(-50%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        z-index: 4;
+      }
+      .rail-btn {
+        width: 46px;
+        height: 46px;
+        border-radius: 50%;
+        color: #fff;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+      }
+      .rail-btn.active {
+        background: rgba(255, 255, 255, 0.92);
+        color: #111;
+      }
+
+      /* ---- Intensity toggle ---- */
+      .intensity-toggle {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        border-radius: 22px;
+        overflow: hidden;
+        padding: 3px;
+      }
+      /* скользящий бегунок — плавно переезжает между Intense и Pastel */
+      .intensity-thumb {
+        position: absolute;
+        left: 3px;
+        right: 3px;
+        top: 3px;
+        height: calc(50% - 3px);
+        border-radius: 19px;
+        background: rgba(255, 255, 255, 0.95);
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+        transition: transform 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+        z-index: 0;
+      }
+      .intensity-toggle.is-pastel .intensity-thumb { transform: translateY(100%); }
+      .intensity-toggle button {
+        position: relative;
+        z-index: 1;
+        border: none;
+        background: none;
+        color: rgba(255, 255, 255, 0.85);
+        padding: 7px 14px;
+        font-size: 12px;
+        cursor: pointer;
+        font-weight: 600;
+        white-space: nowrap;
+        transition: color 0.22s ease;
+      }
+      .intensity-toggle button.active { color: #111; }
+
+
+      /* ---- FPS ---- */
+      .fps {
+        position: absolute;
+        top: 14px;
+        left: 16px;
+        font-size: 11px;
+        font-weight: 700;
+        color: #fff;
+        background: rgba(0, 0, 0, 0.35);
+        backdrop-filter: blur(6px);
+        padding: 3px 8px;
+        border-radius: 8px;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.5px;
+      }
+
+      /* ---- Bottom bar ---- */
+      .bottom-bar {
+        position: absolute;
+        bottom: 24px;
+        left: 0;
+        right: 0;
+        display: flex;
+        align-items: flex-end; /* кнопка камеры — на уровне палитры (низа) */
+        gap: 14px;
+        padding: 0 18px;
+        justify-content: center;
+      }
+      .color-picker {
+        position: relative;
+        flex: 1 1 0;
+        min-width: 0;     /* позволяем флекс-элементу сжиматься (карусель не распирает) */
+        max-width: 560px;
+        display: flex;
+        flex-direction: column;
+      }
+      /* Карточка плавает НАД каруселью (absolute), чтобы её появление/закрытие
+         не сдвигало прокрутку цветов. */
+      .product-card {
+        position: absolute;
+        bottom: calc(100% + 8px);
+        left: 0;
+        right: 0;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        border-radius: 30px;
+        padding: 8px 40px 8px 16px;
+      }
+      .product-swatch {
+        width: 44px;
+        height: 44px;
+        border-radius: 50%;
+        flex-shrink: 0;
+        border: 2px solid rgba(255, 255, 255, 0.5);
+        background-color: var(--c, #888);
+        background-image:
+          radial-gradient(circle at 34% 26%, rgba(255, 255, 255, 0.45), transparent 42%),
+          repeating-linear-gradient(118deg, rgba(255, 255, 255, 0.16) 0 1px, transparent 1px 4px),
+          repeating-linear-gradient(118deg, rgba(0, 0, 0, 0.28) 0 1px, transparent 1px 6px);
+        background-blend-mode: screen, screen, multiply;
+      }
+      .product-close {
+        position: absolute;
+        top: 50%;
+        right: 12px;
+        transform: translateY(-50%);
+        width: 26px;
+        height: 26px;
+        border-radius: 50%;
+        border: none;
+        background: rgba(255, 255, 255, 0.15);
+        color: #fff;
+        font-size: 18px;
+        line-height: 1;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .product-box {
+        width: 40px;
+        height: 54px;
+        border-radius: 7px;
+        object-fit: cover;
+        flex-shrink: 0;
+        background: #fff;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+      }
+      .product-info { min-width: 0; flex: 1; }
+      .product-name {
+        color: #fff;
+        font-weight: 700;
+        font-size: 14.5px;
+        line-height: 1.2;
+        white-space: normal; /* длинные названия переносятся, а не «...» */
+      }
+      .product-subtitle { color: rgba(255, 255, 255, 0.7); font-size: 12px; white-space: nowrap; }
+
+      .swatch-row {
+        display: flex;
+        gap: 10px;
+        overflow-x: auto;
+        padding: 8px 14px;
+        border-radius: 34px;
+        scrollbar-width: none;
+        -webkit-overflow-scrolling: touch; /* инерционный скролл на тач */
+        touch-action: pan-x;               /* свайп пальцем */
+        scroll-snap-type: x mandatory;     /* всегда доводим выбранный до центра */
+        overscroll-behavior-x: contain;
+      }
+      .swatch-row::-webkit-scrollbar { display: none; }
+      /* Спейсеры, чтобы даже крайние сватчи могли встать по центру.
+         ~5 сватчей видно одновременно, выбранный — посередине. */
+      .swatch-row::before,
+      .swatch-row::after {
+        content: '';
+        flex: 0 0 calc(50% - 29px);
+      }
+      /* Сватч как «прядь волос»: цвет оттенка (var(--c)) + диагональные пряди и
+         блик поверх. Цвет задаётся инлайн через --c, текстура — здесь. */
+      .swatch {
+        width: 52px;
+        height: 52px;
+        border-radius: 50%;
+        border: 2px solid transparent;
+        cursor: pointer;
+        transition: transform 0.18s ease, border-color 0.18s ease;
+        background-color: var(--c, #888);
+        background-image:
+          radial-gradient(circle at var(--hl, 34%) 26%, rgba(255, 255, 255, 0.45), transparent 42%),
+          repeating-linear-gradient(var(--a, 118deg), rgba(255, 255, 255, 0.16) 0 1px, transparent 1px 4px),
+          repeating-linear-gradient(var(--a, 118deg), rgba(0, 0, 0, 0.28) 0 1px, transparent 1px 6px);
+        background-blend-mode: screen, screen, multiply;
+      }
+      /* Активный (центральный) сватч — выделен и крупнее. */
+      .swatch-swiper .swiper-slide-active .swatch {
+        border-color: #fff;
+        transform: scale(1.14);
+      }
+
+      .capture-btn {
+        width: 64px;
+        height: 64px;
+        border-radius: 50%;
+        color: #fff;
+        cursor: pointer;
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .capture-btn:disabled { opacity: 0.5; cursor: default; }
+
+      /* ---- Countdown + capture ---- */
+      .countdown {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 120px;
+        font-weight: 800;
+        color: #fff;
+        text-shadow: 0 2px 20px rgba(0, 0, 0, 0.6);
+        pointer-events: none;
+      }
+      /* ---- Captured photo screen ---- */
+      .capture-screen { position: absolute; inset: 0; z-index: 15; background: #000; }
+      .capture-photo {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      .capture-x {
+        position: absolute;
+        top: 14px;
+        left: 14px;
+        z-index: 3;
+      }
+      .capture-download {
+        position: absolute;
+        top: 14px;
+        right: 14px;
+        z-index: 3;
+      }
+      .guide-backdrop {
+        position: absolute;
+        inset: 0;
+        z-index: 2;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .guide-box {
+        position: relative;
+        background: rgba(255, 255, 255, 0.16);
+        backdrop-filter: blur(24px) saturate(160%);
+        -webkit-backdrop-filter: blur(24px) saturate(160%);
+        border: 1px solid rgba(255, 255, 255, 0.28);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 8px 24px rgba(0, 0, 0, 0.3);
+        border-radius: 18px;
+        padding: 26px 32px;
+        max-width: 82%;
+        text-align: center;
+        color: #fff;
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.45); /* лёгкая тень для читаемости */
+      }
+      .guide-box strong {
+        display: block;
+        font-family: Georgia, serif;
+        font-size: 20px;
+        letter-spacing: 1px;
+        margin-bottom: 10px;
+      }
+      .guide-box span { font-size: 16px; opacity: 0.95; }
+      .guide-x {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        width: 26px;
+        height: 26px;
+        border-radius: 50%;
+        border: none;
+        background: rgba(255, 255, 255, 0.18);
+        color: #fff;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .capture-product {
+        position: absolute;
+        bottom: 24px;
+        left: 18px;
+        right: 18px;
+        z-index: 3;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        border-radius: 30px;
+        padding: 8px 16px;
+        background: rgba(255, 255, 255, 0.14);
+        backdrop-filter: blur(22px) saturate(160%);
+        -webkit-backdrop-filter: blur(22px) saturate(160%);
+        border: 1px solid rgba(255, 255, 255, 0.22);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 6px 18px rgba(0, 0, 0, 0.22);
+      }
+
+      /* ---- Status ---- */
+      .status {
+        position: absolute;
+        bottom: 120px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0, 0, 0, 0.7);
+        color: #fff;
+        padding: 12px 20px;
+        border-radius: 10px;
+        font-size: 14px;
+        max-width: 80%;
+        text-align: center;
+      }
+      .status.error { background: rgba(160, 20, 20, 0.85); }
+
+      /* ---- Intense/Pastel над кнопкой камеры ---- */
+      .capture-col {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: space-between; /* Intense сверху (уровень карточки), камера снизу (уровень палитры) */
+        flex-shrink: 0;
+      }
+
+      /* Сохранение снимка по долгому тапу (iOS) — нужен touch-callout default
+         и доступность картинки (поверх неё не должно быть перехватчиков). */
+      .capture-photo {
+        -webkit-touch-callout: default;
+        -webkit-user-select: auto;
+        user-select: auto;
+        pointer-events: auto;
+        z-index: 1;
+      }
+      .guide-backdrop { pointer-events: none; }
+      .guide-box { pointer-events: auto; }
+
+      /* ---- Legal overlay ---- */
+      .legal-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 40;
+        background: #fff;
+        color: #1a1a1a;
+        display: flex;
+        flex-direction: column;
+        padding: 16px 18px 0;
+        box-sizing: border-box;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      .legal-close {
+        position: absolute;
+        top: 12px;
+        right: 14px;
+        border: none;
+        background: none;
+        font-size: 26px;
+        line-height: 1;
+        cursor: pointer;
+        color: #111;
+      }
+      .legal-head { margin: 4px 0 12px; }
+      .legal-mode { font-size: 12px; color: #888; }
+      .legal-product { font-weight: 700; font-size: 16px; margin-top: 2px; }
+      .legal-product-sub { font-size: 13px; color: #666; }
+      .legal-tabs {
+        display: flex;
+        gap: 18px;
+        border-bottom: 1px solid #e4e4e4;
+        margin: 28px 40px 12px 0; /* справа место под крестик, сверху отступ */
+      }
+      .legal-tabs button {
+        border: none;
+        background: none;
+        padding: 8px 0;
+        font-size: 14px;
+        font-weight: 600;
+        color: #999;
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+        margin-bottom: -1px;
+      }
+      .legal-tabs button.active { color: #111; border-bottom-color: #111; }
+      .legal-body { overflow-y: auto; padding-bottom: 24px; -webkit-overflow-scrolling: touch; }
+      .legal-body h3 { font-size: 18px; margin: 4px 0 12px; }
+      .legal-body h4 { font-size: 14px; margin: 16px 0 6px; }
+      .legal-body p { margin: 0 0 10px; color: #333; }
+      .legal-mono { font-family: monospace; font-size: 12px; color: #555 !important; word-break: break-word; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

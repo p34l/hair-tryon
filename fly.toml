@@ -1,0 +1,23 @@
+# fly.toml app configuration file generated for hair-tryon-poc on 2026-06-23T21:57:37+03:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'hair-tryon-poc'
+primary_region = 'fra'
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # держим машину «тёплой», иначе первый визит после простоя ждёт холодный старт
+  auto_stop_machines = 'suspend'
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '512mb'
+  cpus = 1
+  memory_mb = 512

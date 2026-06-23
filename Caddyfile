@@ -1,0 +1,7 @@
+:8080 {
+	root * /srv
+	encode gzip
+	file_server
+	# одностраничное приложение: всё, чего нет на диске, отдаём как index.html
+	try_files {path} /index.html
+}
