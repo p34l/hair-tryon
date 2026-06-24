@@ -207,18 +207,41 @@ const RAW_PRESETS: ColorPreset[] = [
   { id: "L75_76", code: "L75", name: "Deep Red", subtitle: "2 in 1 Lightening and Colour | Anti-Fading Effect for vibrant results", hex: "#80152a", image: "https://sk-qr.com/assets/images/appearance/LIVE/L75.jpeg", swatchImage: "https://sk-qr.com/assets/images/slider/LIVE/L75.jpg", real: true },
 ];
 
+/** Воспринимаемая яркость hex-цвета (0..255) — для сортировки палитры. */
+function hexLuma(hex: string): number {
+  const v = hex.replace('#', '');
+  const r = parseInt(v.slice(0, 2), 16) || 0;
+  const g = parseInt(v.slice(2, 4), 16) || 0;
+  const b = parseInt(v.slice(4, 6), 16) || 0;
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
 /**
- * Палитра, упорядоченная по коду оттенка (натуральная сортировка), вторичный
- * ключ — id, чтобы порядок был детерминирован при равных кодах. Сортируем
- * КОПИЮ (без мутации исходного массива) — модуль остаётся без сайд-эффектов.
+ * Раскладка палитры: ТЁМНЫЕ по краям, СВЕТЛЫЕ (блонд/платина) в ЦЕНТРЕ скролла.
+ * Карусель закольцована, поэтому «в конце» = один свайп назад от старта — значит
+ * чтобы до светлых нельзя было быстро догортать, их кладём в середину, а тёмные
+ * (которые хорошо ложатся) — на внешние позиции (старт и точка заворота).
+ *
+ * Делаем bitonic-раскладку: сортируем по яркости (тёмные->светлые), затем кладём
+ * по очереди на внешние позиции (0, N-1, 1, N-2, ...). Так самые тёмные попадают
+ * к краям, а самые светлые сходятся в центр. Сортируем КОПИЮ (без мутации).
  */
-export const PRESETS: ColorPreset[] = [...RAW_PRESETS].sort((a, b) => {
-  const byCode = a.code.localeCompare(b.code, undefined, {
-    numeric: true,
-    sensitivity: 'base',
-  });
+const byLuma = [...RAW_PRESETS].sort((a, b) => {
+  const dl = hexLuma(a.hex) - hexLuma(b.hex);
+  if (Math.abs(dl) > 0.5) return dl; // тёмные -> светлые
+  const byCode = a.code.localeCompare(b.code, undefined, { numeric: true, sensitivity: 'base' });
   return byCode !== 0 ? byCode : a.id.localeCompare(b.id);
 });
+export const PRESETS: ColorPreset[] = (() => {
+  const out: ColorPreset[] = new Array(byLuma.length);
+  let lo = 0;
+  let hi = byLuma.length - 1;
+  for (let i = 0; i < byLuma.length; i++) {
+    if (i % 2 === 0) out[lo++] = byLuma[i]; // тёмные -> к началу/краю
+    else out[hi--] = byLuma[i];             // следующие -> к концу/краю
+  }
+  return out; // тёмные по краям, светлые в центре
+})();
 
 /**
  * LUT-атлас (яркость->цвет по каждому оттенку), построенный из фото прядей.
