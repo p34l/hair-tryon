@@ -5,7 +5,8 @@
 export function createGLContext(canvas: HTMLCanvasElement): WebGL2RenderingContext {
   const gl = canvas.getContext('webgl2', {
     premultipliedAlpha: false,
-    preserveDrawingBuffer: true, // нужно для снимка кадра (кнопка фото)
+    // preserveDrawingBuffer НЕ включаем (он тормозит композитинг): снимок кадра
+    // делаем через gl.readPixels сразу после drawArrays (см. Renderer.requestCapture).
   });
   if (!gl) {
     throw new Error('WebGL2 не поддерживается этим браузером.');

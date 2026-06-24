@@ -55,11 +55,10 @@
       segmenter = await ImageSegmenter.createFromOptions(fileset, {
         baseOptions: { modelAssetPath: modelPath, delegate: 'GPU' },
         runningMode: 'VIDEO',
-        // Этап 1: мягкая (confidence) маска — главный источник «кипения» края.
-        // Берём вероятность класса hair как есть (0..1 -> 0..255), без бинарного
-        // порога: переходы волосы/фон становятся плавными, а EMA/feather дальше
-        // их докручивают. categoryMask держим фолбэком (старая бинарная логика).
-        outputCategoryMask: true,
+        // Мягкая (confidence) маска класса hair — без бинарного порога (край не
+        // «кипит»). categoryMask НЕ запрашиваем: её argmax — лишняя работа каждый
+        // инференс (грелся GPU), а используем мы только confidenceMasks[1].
+        outputCategoryMask: false,
         outputConfidenceMasks: true,
       });
       // Прогрев на холостом кадре: ПЕРВЫЙ инференс компилирует GPU-кернелы —
@@ -92,13 +91,14 @@
     }
   }
 
-  function segment(bitmap: ImageBitmap, timestamp: number) {
-    if (!segmenter) {
-      bitmap.close();
-      return;
-    }
-    offCtx.drawImage(bitmap, 0, 0, INFERENCE_SIZE, INFERENCE_SIZE);
-    bitmap.close();
+  function segment(pixels: ArrayBuffer, w: number, h: number, timestamp: number) {
+    if (!segmenter) return;
+    // Кадр приходит как СЫРЫЕ ПИКСЕЛИ (ImageData buffer), а не ImageBitmap:
+    // createImageBitmap течёт по памяти на iOS Safari (закрытые битмапы не
+    // освобождаются) — за ~30с упирается в лимит вкладки и FPS падает без отката.
+    // putImageData в reused-canvas аллокаций не плодит.
+    const id = new ImageData(new Uint8ClampedArray(pixels), w, h);
+    offCtx.putImageData(id, 0, 0);
 
     // Гарантируем строго возрастающий timestamp (после прогрева и в принципе).
     let ts = timestamp;
@@ -117,8 +117,14 @@
           const probs: Float32Array = hairConf.getAsFloat32Array();
           if (maskBuffer.length !== probs.length) maskBuffer = new Uint8Array(probs.length);
           for (let i = 0; i < probs.length; i++) {
-            // clamp(p*255, 0, 255) — мягкая запись без бинаризации.
-            const v = probs[i] * 255.0;
+            // Контраст вероятности перед квантованием: smoothstep(0.2,0.8) гасит
+            // низкоуверенный спекл (фон) и подтягивает уверенное ядро, сохраняя
+            // мягкий градиент на переходе 0.2..0.8 (согласовано с MASK_EDGE_LOW/HIGH
+            // в шейдере). Без бинаризации — край не «кипит».
+            let t = (probs[i] - 0.2) / 0.6;
+            t = t < 0 ? 0 : t > 1 ? 1 : t;
+            const p = t * t * (3.0 - 2.0 * t);
+            const v = p * 255.0;
             maskBuffer[i] = v < 0 ? 0 : v > 255 ? 255 : v;
           }
           wrote = true;
@@ -147,6 +153,6 @@
   self.onmessage = (e: MessageEvent) => {
     const msg = e.data;
     if (msg.type === 'init') init(msg.modelPath);
-    else if (msg.type === 'segment') segment(msg.bitmap, msg.timestamp);
+    else if (msg.type === 'segment') segment(msg.pixels, msg.width, msg.height, msg.timestamp);
   };
 })();

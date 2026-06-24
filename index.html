@@ -282,6 +282,54 @@
         color: #111;
       }
 
+      /* ---- Split-view делитель (before/after) ---- */
+      .split-divider {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 2px;
+        margin-left: -1px;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 0 8px rgba(0, 0, 0, 0.45);
+        z-index: 6;
+        cursor: ew-resize;
+        touch-action: none; /* без этого pointermove на мобиле скроллит страницу */
+      }
+      /* широкая невидимая зона захвата по всей высоте — удобно тянуть пальцем */
+      .split-divider::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: -22px;
+        right: -22px;
+      }
+      .split-handle {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.95);
+        box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+      }
+      /* двойная стрелка ‹ › на ручке */
+      .split-handle::before,
+      .split-handle::after {
+        content: '';
+        position: absolute;
+        top: 50%;
+        width: 0;
+        height: 0;
+        border-top: 5px solid transparent;
+        border-bottom: 5px solid transparent;
+        transform: translateY(-50%);
+      }
+      .split-handle::before { left: 9px; border-right: 7px solid #222; }
+      .split-handle::after  { right: 9px; border-left: 7px solid #222; }
+
       /* ---- Intensity toggle ---- */
       .intensity-toggle {
         position: relative;

@@ -43,13 +43,21 @@ export class MaskProcessor {
     const prev = this.prev;
     const n = current.length;
 
-    // 1) Оценка движения: средняя |current−prev| / 255 по всей маске.
+    // 1) Движение считаем ТОЛЬКО по зоне волос (cur>0 || prev>0): движение фона
+    //    не должно раздувать alpha, иначе край волос зря «кипит». Знаменатель —
+    //    число активных текселей.
     let diffSum = 0;
+    let active = 0;
     for (let i = 0; i < n; i++) {
-      const d = current[i] - prev[i];
-      diffSum += d < 0 ? -d : d;
+      const c = current[i];
+      const p = prev[i];
+      if (c > 0 || p > 0) {
+        const d = c - p;
+        diffSum += d < 0 ? -d : d;
+        active++;
+      }
     }
-    const motion = diffSum / (n * 255);
+    const motion = active > 0 ? diffSum / (active * 255) : 0;
 
     // 2) Адаптивный alpha: покой -> STILL, движение -> к MAX.
     let a = EMA_ALPHA_STILL + motion * EMA_MOTION_GAIN;
@@ -67,7 +75,9 @@ export class MaskProcessor {
   }
 
   /**
-   * Главная точка входа: (опц.) вычитание зоны бороды/лица, затем (опц.) EMA.
+   * Главная точка входа. Порядок: СНАЧАЛА темпоральное EMA по сырой маске волос,
+   * ПОТОМ вычитание зоны бороды/лица (жёсткий вырез) — иначе exclusion попадал бы
+   * в историю EMA и «тянулся» при движении головы.
    */
   process(
     rawHair: Uint8Array,
@@ -75,22 +85,27 @@ export class MaskProcessor {
   ): Uint8Array {
     let mask = rawHair;
 
-    // Этап 1: вычитаем зону бороды/лица — там маска волос обнуляется.
+    // Этап 2: адаптивное темпоральное сглаживание (по чистой маске волос).
+    if (opts.smooth) {
+      mask = this.applyEMA(mask);
+    }
+
+    // Этап 1: вычитаем зону бороды/лица — ПОСЛЕ сглаживания.
     if (opts.exclusion) {
       const ex = opts.exclusion;
       if (this.excluded.length !== mask.length) {
         this.excluded = new Uint8Array(mask.length);
       }
-      const result = this.excluded;
-      for (let i = 0; i < mask.length; i++) {
-        result[i] = ex[i] ? 0 : mask[i];
+      // Не мутируем входной/EMA-буфер, если он переиспользуется как история.
+      let target = mask;
+      if (target === rawHair) {
+        this.excluded.set(rawHair);
+        target = this.excluded;
       }
-      mask = result;
-    }
-
-    // Этап 2: адаптивное темпоральное сглаживание.
-    if (opts.smooth) {
-      mask = this.applyEMA(mask);
+      for (let i = 0; i < target.length; i++) {
+        if (ex[i]) target[i] = 0;
+      }
+      mask = target;
     }
 
     return mask;

@@ -1,14 +1,18 @@
 /**
  * Выбор цвета — карусель на Swiper (как в референсе): 5 сватчей в кадре,
- * центральный = выбранный, бесконечный цикл (после последнего идёт первый),
- * свайп/драг мышью и пальцем, плавная анимация. Над каруселью — карточка
- * выбранного продукта (реальное фото упаковки + код/название + claim).
+ * центральный = выбранный, бесконечный цикл, свайп/драг. Над каруселью —
+ * карточка выбранного продукта (фото упаковки + код/название + claim).
  *
- * Сватч показывает реальное фото пряди (swatchImage); если его нет — CSS-текстура
- * в цвете оттенка. Цвет передаётся как CSS-переменная --c.
+ * Перф:
+ * - Карусель вынесена в memo-компонент SwatchSwiper, который НЕ зависит от
+ *   selectedId → при смене цвета Swiper не ре-рендерится (иначе loop пересоздаёт
+ *   клоны и копит DOM).
+ * - Все фото (сватчи + коробки) ПРЕДзагружаются при старте (на экране загрузки)
+ *   и держатся декодированными — поэтому при гортании/переключении за сессию
+ *   ничего не грузится и не декодируется на лету (нет лагов), а объём фиксирован.
  */
 
-import { useRef, useState, type CSSProperties } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { Swiper, SwiperSlide } from 'swiper/react';
 import { Mousewheel } from 'swiper/modules';
 import type { Swiper as SwiperClass } from 'swiper';
@@ -52,18 +56,98 @@ function swatchStyle(p: ColorPreset, i = 0): CSSProperties {
     base.backgroundImage = `url(${p.swatchImage})`;
     base.backgroundSize = 'cover';
     base.backgroundPosition = 'center';
-    // не подмешиваем цвет/текстуру к реальному фото пряди
     base.backgroundColor = 'transparent';
     base.backgroundBlendMode = 'normal';
   }
   return base;
 }
 
-export function ColorPicker({ presets, selectedId, onSelect }: Props) {
-  const selected = presets.find((p) => p.id === selectedId) ?? presets[0];
+/**
+ * Карусель сватчей. memo + props НЕ содержат selectedId => не ре-рендерится при
+ * смене цвета. Подсветка выбранного — через CSS .swiper-slide-active.
+ */
+const SwatchSwiper = memo(function SwatchSwiper({
+  presets,
+  onSelect,
+}: {
+  presets: ColorPreset[];
+  onSelect: (p: ColorPreset) => void;
+}) {
   const swiperRef = useRef<SwiperClass | null>(null);
+  // Дебаунс: при быстром гортании коммитим цвет только после остановки (~120 мс).
+  const selectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const debouncedSelect = (p: ColorPreset) => {
+    if (selectTimer.current) clearTimeout(selectTimer.current);
+    selectTimer.current = setTimeout(() => onSelect(p), 120);
+  };
+  useEffect(() => () => { if (selectTimer.current) clearTimeout(selectTimer.current); }, []);
+
+  const slides = useMemo(
+    () =>
+      presets.map((p, i) => (
+        <SwiperSlide key={p.id}>
+          <button
+            className="swatch"
+            style={swatchStyle(p, i)}
+            onClick={() => swiperRef.current?.slideToLoop(i, 350)}
+            aria-label={p.name}
+            title={p.code ? `${p.code} | ${p.name}` : p.name}
+          />
+        </SwiperSlide>
+      )),
+    [presets],
+  );
+
+  return (
+    <Swiper
+      className="swatch-swiper"
+      modules={[Mousewheel]}
+      slidesPerView="auto"
+      centeredSlides
+      loop
+      grabCursor
+      simulateTouch
+      spaceBetween={12}
+      speed={350}
+      mousewheel={{ forceToAxis: true, sensitivity: 1, releaseOnEdges: false }}
+      onSwiper={(sw) => { swiperRef.current = sw; }}
+      onSlideChange={(sw) => {
+        const p = presets[sw.realIndex];
+        if (p) debouncedSelect(p);
+      }}
+    >
+      {slides}
+    </Swiper>
+  );
+});
+
+export const ColorPicker = memo(function ColorPicker({ presets, selectedId, onSelect }: Props) {
+  const selected = presets.find((p) => p.id === selectedId) ?? presets[0];
   const [open, setOpen] = useState(true);
   const mock = boxMockup(selected);
+
+  // ПРЕДзагрузка всех фото (сватчи + коробки) один раз при монтировании (идёт на
+  // экране загрузки параллельно с моделью). Держим ссылки в ref, чтобы картинки
+  // оставались декодированными — тогда при гортании/смене оттенков за сессию
+  // ничего не грузится и не декодируется на лету (нет лагов). Объём фиксирован,
+  // т.к. реальные утечки (createImageBitmap/SRGB) уже устранены.
+  const preloadRef = useRef<HTMLImageElement[]>([]);
+  useEffect(() => {
+    const imgs: HTMLImageElement[] = [];
+    for (const p of presets) {
+      if (p.swatchImage) { const im = new Image(); im.decoding = 'async'; im.src = p.swatchImage; imgs.push(im); }
+      if (p.image) { const im = new Image(); im.decoding = 'async'; im.src = p.image; imgs.push(im); }
+    }
+    preloadRef.current = imgs;
+    return () => { preloadRef.current = []; };
+  }, [presets]);
+
+  // Стабильный колбэк выбора: коммитит цвет + раскрывает карточку. Стабилен =>
+  // SwatchSwiper не ре-рендерится при смене цвета.
+  const handleSelect = useCallback(
+    (p: ColorPreset) => { onSelect(p); setOpen(true); },
+    [onSelect],
+  );
 
   return (
     <div className="color-picker">
@@ -85,35 +169,7 @@ export function ColorPicker({ presets, selectedId, onSelect }: Props) {
         </div>
       )}
 
-      <Swiper
-        className="swatch-swiper"
-        modules={[Mousewheel]}
-        slidesPerView="auto"
-        centeredSlides
-        loop
-        grabCursor
-        simulateTouch
-        spaceBetween={12}
-        speed={350}
-        mousewheel={{ forceToAxis: true, sensitivity: 1, releaseOnEdges: false }}
-        onSwiper={(sw) => { swiperRef.current = sw; }}
-        onSlideChange={(sw) => {
-          const p = presets[sw.realIndex];
-          if (p) { onSelect(p); setOpen(true); }
-        }}
-      >
-        {presets.map((p, i) => (
-          <SwiperSlide key={p.id}>
-            <button
-              className={`swatch ${p.id === selectedId ? 'selected' : ''}`}
-              style={swatchStyle(p, i)}
-              onClick={() => swiperRef.current?.slideToLoop(i, 350)}
-              aria-label={p.name}
-              title={p.code ? `${p.code} | ${p.name}` : p.name}
-            />
-          </SwiperSlide>
-        ))}
-      </Swiper>
+      <SwatchSwiper presets={presets} onSelect={handleSelect} />
     </div>
   );
-}
+});

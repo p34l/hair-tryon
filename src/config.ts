@@ -36,12 +36,27 @@ export const MODEL = {
  * alpha не фиксирован: считаем движение как среднюю нормированную |cur−prev|
  * по всей маске (0..1) и интерполируем
  *   alpha = clamp(EMA_ALPHA_STILL + motion*EMA_MOTION_GAIN, EMA_ALPHA_STILL, MASK_EMA_ALPHA)
- * В покое alpha мал (≈0.22) → край не «кипит»; в движении растёт (→0.85) →
- * цвет следует за волосами без призрака/запаздывания.
+ * В покое alpha мал (≈0.22) → край не «кипит»; при быстром движении растёт почти
+ * до 1.0 → маска «клацает» на свежую и не отстаёт от волос (хвост ~5%).
  */
-export const MASK_EMA_ALPHA = 0.85;   // верхняя граница (быстрая реакция в движении)
+export const MASK_EMA_ALPHA = 0.95;   // верхняя граница (почти без хвоста при быстром движении)
 export const EMA_ALPHA_STILL = 0.22;  // нижняя граница (стабильность в покое)
-export const EMA_MOTION_GAIN = 14.0;  // насколько резко alpha растёт с движением
+export const EMA_MOTION_GAIN = 16.0;  // насколько резко alpha растёт с движением
+
+/**
+ * Минимальный интервал между отправками кадра в воркер сегментации (мс).
+ * Coalescing (latest-wins) держит маску свежей, но БЕЗ кепа воркер на мобильном
+ * GPU молотит на 100% и отнимает кадры у рендера — особенно при движении головы.
+ * ~22 Гц сегментации — маска хорошо «держится» на голове при движении.
+ */
+export const SEG_MIN_INTERVAL_MS = 45;
+
+/**
+ * Интервал детекта FaceLandmarker (мс). При быстром движении MediaPipe теряет
+ * трекинг и гоняет тяжёлый полный детектор на главном потоке — реже = меньше
+ * просадок FPS в движении. Борода двигается медленно, ~4 Гц хватает.
+ */
+export const FACE_DETECT_INTERVAL_MS = 250;
 
 /** Радиус размытия краёв маски в пикселях текстуры маски (этап 2). */
 export const FEATHER_RADIUS = 2.0;
@@ -50,9 +65,9 @@ export const FEATHER_RADIUS = 2.0;
  * Потолок высоты рендер-таргета в физ. пикселях (этап 5). Канвас держим в
  * аспекте видео (иначе sampleUv растянет картинку), но масштабируем под
  * фактический размер вывода × devicePixelRatio с потолком — чтобы шейдер не
- * считал per-pixel на 1080p зря. ~900 даёт чёткую картинку на мобильном.
+ * считал per-pixel на 1080p зря. 1280 — чёткая картинка на high-DPI экранах.
  */
-export const MAX_RENDER_HEIGHT = 900;
+export const MAX_RENDER_HEIGHT = 1280;
 
 /**
  * Matting-край (этап 3). Joint-bilateral апсемпл мягкой маски по hi-res видео.
@@ -104,7 +119,7 @@ import type { ColorPreset } from './types';
  *  - цвет hex — реальный из AR-API (.../v1/client/products/{guid}, поле rgbColor).
  * image — фото упаковки, swatchImage — фото пряди (hotlink на ассеты sk-qr.com).
  */
-export const PRESETS: ColorPreset[] = [
+const RAW_PRESETS: ColorPreset[] = [
   // Реальный каталог Schwarzkopf LIVE (77). hex — цвет оттенка из AR-API
   // (насыщенный, читается на волосах). swatchImage — фото пряди, image — упаковка.
   { id: "00P_0", code: "00P", name: "Bold Blonde", subtitle: "Anti-Brassiness | Up to 80% less hair breakage", hex: "#f2ca8c", image: "https://sk-qr.com/assets/images/appearance/LIVE/00P_PowderBleachBoldBlonde.jpeg", swatchImage: "https://sk-qr.com/assets/images/slider/LIVE/00P_PowderBleachBoldBlonde.jpg", real: true },
@@ -187,6 +202,19 @@ export const PRESETS: ColorPreset[] = [
 ];
 
 /**
+ * Палитра, упорядоченная по коду оттенка (натуральная сортировка), вторичный
+ * ключ — id, чтобы порядок был детерминирован при равных кодах. Сортируем
+ * КОПИЮ (без мутации исходного массива) — модуль остаётся без сайд-эффектов.
+ */
+export const PRESETS: ColorPreset[] = [...RAW_PRESETS].sort((a, b) => {
+  const byCode = a.code.localeCompare(b.code, undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  });
+  return byCode !== 0 ? byCode : a.id.localeCompare(b.id);
+});
+
+/**
  * LUT-атлас (яркость->цвет по каждому оттенку), построенный из фото прядей.
  * Строка = оттенок (в порядке PRESETS), X = яркость волоса. Шейдер сэмплит его
  * вместо простого HSL-сдвига — это повторяет подход LUT light/dark из референса.
@@ -198,18 +226,12 @@ export function presetRow(id: string): number {
   return PRESETS.findIndex((p) => p.id === id);
 }
 
-/** hex (#rrggbb) -> RGB 0..1 для прокидывания в шейдер. */
+/** hex (#rrggbb) -> RGB 0..1 для прокидывания в шейдер. Битый hex -> 0. */
 export function hexToRgb(hex: string): import('./types').RGB {
   const v = hex.replace('#', '');
-  return {
-    r: parseInt(v.slice(0, 2), 16) / 255,
-    g: parseInt(v.slice(2, 4), 16) / 255,
-    b: parseInt(v.slice(4, 6), 16) / 255,
+  const ch = (s: string) => {
+    const n = parseInt(s, 16);
+    return Number.isNaN(n) ? 0 : n / 255;
   };
+  return { r: ch(v.slice(0, 2)), g: ch(v.slice(2, 4)), b: ch(v.slice(4, 6)) };
 }
-
-// Упорядочиваем палитру по коду оттенка (натуральная сортировка: числа по
-// возрастанию, напр. 030 < 035 < 092 ... затем буквенные коды B/L/M/P/T/U).
-PRESETS.sort((a, b) =>
-  a.code.localeCompare(b.code, undefined, { numeric: true, sensitivity: 'base' }),
-);

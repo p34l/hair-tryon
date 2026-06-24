@@ -8,14 +8,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { Renderer } from '../render/renderer';
 import { MaskProcessor } from '../pipeline/maskProcessing';
-import { FaceMaskBuilder } from '../pipeline/faceLandmarks';
 import { startCamera } from '../pipeline/camera';
 import { ColorPicker } from './ColorPicker';
 import { IntensityToggle } from './IntensityToggle';
 import { LegalOverlay } from './LegalOverlay';
 import {
   PRESETS, INFERENCE_SIZE, INTENSITY_PARAMS, MODEL, LOGO,
-  hexToRgb, CAPTURE_COUNTDOWN,
+  hexToRgb, CAPTURE_COUNTDOWN, FACE_DETECT_INTERVAL_MS,
 } from '../config';
 import type { Intensity, ColorPreset, WorkerResponse } from '../types';
 
@@ -87,8 +86,13 @@ function cropPortrait(canvas: HTMLCanvasElement, preset: ColorPreset): string {
   const cardX = pad, cardW = W - pad * 2;
   ctx.fillStyle = 'rgba(0,0,0,0.46)';
   ctx.beginPath();
-  (ctx as any).roundRect(cardX, cardY, cardW, cardH, cardH / 2);
-  ctx.fill();
+  // roundRect есть не везде (старый Safari) — фолбэк на обычный прямоугольник.
+  if (typeof (ctx as any).roundRect === 'function') {
+    (ctx as any).roundRect(cardX, cardY, cardW, cardH, cardH / 2);
+    ctx.fill();
+  } else {
+    ctx.fillRect(cardX, cardY, cardW, cardH);
+  }
 
   const r = cardH * 0.34;
   const cx = cardX + cardH * 0.55, cy = cardY + cardH * 0.5;
@@ -132,11 +136,28 @@ export function CameraView() {
   const rendererRef = useRef<Renderer | null>(null);
   const workerRef = useRef<Worker | null>(null);
   const processorRef = useRef(new MaskProcessor());
-  // Face Landmarker для exclusion-маски бороды (этап 1).
-  const faceBuilderRef = useRef<FaceMaskBuilder | null>(null);
+  // FaceLandmarker теперь в ОТДЕЛЬНОМ воркере (инференс ушёл с главного потока).
+  const faceWorkerRef = useRef<Worker | null>(null);
+  const faceInFlightRef = useRef(false);
+  const faceWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const exclusionRef = useRef<Uint8Array | null>(null);
   const cameraHandleRef = useRef<{ stop: () => void } | null>(null);
   const guideSeenRef = useRef(false); // гайд «HOW TO SAVE» показываем 1 раз за сессию
+  // Замок «кадр в обработке у воркера» + watchdog, чтобы пайплайн не залип,
+  // если воркер уронил кадр (без хака (worker as any).__inFlight).
+  const inFlightRef = useRef(false);
+  const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Текущий blob-URL фото (для revoke) и токен запроса (анти-гонка onload).
+  const blobUrlRef = useRef<string | null>(null);
+  const photoReqRef = useRef(0);
+  // Таймер обратного отсчёта снимка (чистим в общем cleanup).
+  const captureTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const captureBusyRef = useRef(false);
+  // Pipeline маски (как после Wave 3): latest-wins coalescing + mediaTime.
+  const latestSourceRef = useRef<HTMLVideoElement | HTMLImageElement | null>(null);
+  const frameDirtyRef = useRef(false);
+  const sendSegRef = useRef<((s: HTMLVideoElement | HTMLImageElement) => void) | null>(null);
+  const mediaTimeRef = useRef(0); // mediaTime кадра из rVFC для segmentForVideo
 
   const [status, setStatus] = useState<Status>('loading');
   const [errorMsg, setErrorMsg] = useState('');
@@ -150,6 +171,7 @@ export function CameraView() {
   const [captured, setCaptured] = useState<string | null>(null);
   const [showGuide, setShowGuide] = useState(false);
   const [countdown, setCountdown] = useState(0);
+  const [captureBusy, setCaptureBusy] = useState(false); // для disabled кнопки фото
   // Исключение бороды (этап 1). По умолчанию включено; тумблер для демо.
   // Split-view (before/after): вертикальная линия по центру, левая половина без фильтра.
   const [split, setSplit] = useState(false);
@@ -163,7 +185,10 @@ export function CameraView() {
   const intensityRef = useRef(intensity);
   const modeRef = useRef(mode);
   const splitRef = useRef(split);
-  const splitPosRef = useRef(0.5); // позиция линии split (0..1), двигается пальцем
+  // Позиция делителя как доля ВИДИМОЙ области сцены (0..1). Шейдеру отдаём уже
+  // пересчитанный uv.x с учётом object-fit: cover (см. onFrame).
+  const splitFracRef = useRef(0.5);
+  const dividerRef = useRef<HTMLDivElement>(null);
   presetRef.current = preset;
   intensityRef.current = intensity;
   modeRef.current = mode;
@@ -188,8 +213,16 @@ export function CameraView() {
     );
     workerRef.current = worker;
 
-    let inFlight = false;
+    const clearInFlight = () => {
+      inFlightRef.current = false;
+      if (watchdogRef.current) {
+        clearTimeout(watchdogRef.current);
+        watchdogRef.current = null;
+      }
+    };
+
     worker.onerror = (e) => {
+      clearInFlight(); // не залипаем после ошибки воркера
       setStatus('error');
       setErrorMsg('Worker: ' + (e.message || 'load/runtime error'));
     };
@@ -198,16 +231,22 @@ export function CameraView() {
       if (msg.type === 'ready') {
         setModelReady(true); // модель сегментации загружена -> можно просить камеру
       } else if (msg.type === 'error') {
+        clearInFlight();
         setStatus('error');
         setErrorMsg(msg.message ?? 'Ошибка воркера');
       } else if (msg.type === 'mask') {
-        inFlight = false;
+        clearInFlight();
         const processed = processorRef.current.process(msg.data, {
           smooth: true, // EMA-сглаживание (этап 2)
           // вычитаем зону бороды/нижней части лица (этап 1) — всегда включено
           exclusion: exclusionRef.current,
         });
         rendererRef.current?.updateMask(processed, msg.width, msg.height);
+        // Latest-wins: воркер свободен — сразу шлём свежий кадр (как в Wave 3),
+        // чтобы маска была максимально актуальной (лучше держится на голове).
+        if (frameDirtyRef.current && latestSourceRef.current) {
+          sendSegRef.current?.(latestSourceRef.current);
+        }
       }
     };
 
@@ -217,30 +256,57 @@ export function CameraView() {
       wasmRoot: MODEL.wasmRoot,
     });
 
-    // экспонируем флаг через замыкание ниже
-    (worker as any).__inFlight = () => inFlight;
-    (worker as any).__setInFlight = (v: boolean) => { inFlight = v; };
-
     return () => {
       worker.terminate();
+      workerRef.current = null;
+      clearInFlight();
+      rendererRef.current?.dispose();
+      rendererRef.current = null;
     };
   }, []);
 
-  // --- Инициализация Face Landmarker (этап 1, на главном потоке) ---
+  // --- Инициализация FaceLandmarker во ВТОРОМ воркере (вне главного потока) ---
+  // Раньше detectForVideo крутился на main (через setTimeout на iOS, где нет
+  // requestIdleCallback) и блокировал рендер — главная причина просадки FPS на
+  // iPhone. Теперь инференс и растеризация маски целиком в воркере.
   useEffect(() => {
-    const builder = new FaceMaskBuilder();
-    (window as any).__face = { stage: 'init' };
-    builder
-      .init()
-      .then(() => {
-        faceBuilderRef.current = builder;
-        (window as any).__face = { stage: 'ready' };
-        console.log('[face] FaceLandmarker готов');
-      })
-      .catch((e) => {
-        (window as any).__face = { stage: 'init-error', error: String(e) };
-        console.warn('[face] init failed (борода не исключается):', e);
-      });
+    const worker = new Worker(
+      new URL('../pipeline/faceLandmarks.worker.ts', import.meta.url),
+    );
+    faceWorkerRef.current = worker;
+
+    const clearFaceInFlight = () => {
+      faceInFlightRef.current = false;
+      if (faceWatchdogRef.current) {
+        clearTimeout(faceWatchdogRef.current);
+        faceWatchdogRef.current = null;
+      }
+    };
+
+    worker.onmessage = (e: MessageEvent) => {
+      const msg = e.data;
+      if (msg.type === 'face-mask') {
+        clearFaceInFlight();
+        // msg.data — перенесённый Uint8Array (или null, если лицо не найдено).
+        exclusionRef.current = msg.data ?? null;
+      } else if (msg.type === 'face-error') {
+        clearFaceInFlight();
+        exclusionRef.current = null;
+      }
+      // 'face-ready' — отдельных действий не требует.
+    };
+    worker.onerror = () => { clearFaceInFlight(); };
+
+    worker.postMessage({
+      type: 'init',
+      modelPath: new URL(MODEL.faceLandmarker, location.origin).href,
+    });
+
+    return () => {
+      worker.terminate();
+      faceWorkerRef.current = null;
+      clearFaceInFlight();
+    };
   }, []);
 
   // --- Минимальное время показа экрана загрузки (чтобы анимация не мигала) ---
@@ -261,7 +327,19 @@ export function CameraView() {
     let raf = 0;
     let frameCount = 0;
     let fpsT0 = performance.now();
-    let tick = 0;
+    let lastFaceSend = 0; // троттлинг отправки кадров в face-воркер (~4 Гц)
+
+    // Reused-canvas для подготовки кадра 256 воркерам. Вместо createImageBitmap
+    // (течёт по памяти на iOS) — drawImage+getImageData и transfer буфера пикселей.
+    const frameCanvas = document.createElement('canvas');
+    frameCanvas.width = INFERENCE_SIZE;
+    frameCanvas.height = INFERENCE_SIZE;
+    const frameCtx = frameCanvas.getContext('2d', { willReadFrequently: true })!;
+    // Геометрия как раньше: source растягивается в квадрат 256 (stretch-в-256).
+    const grabPixels = (source: HTMLVideoElement | HTMLImageElement): ImageData => {
+      frameCtx.drawImage(source, 0, 0, INFERENCE_SIZE, INFERENCE_SIZE);
+      return frameCtx.getImageData(0, 0, INFERENCE_SIZE, INFERENCE_SIZE);
+    };
 
     const isUsable = (s: HTMLVideoElement | HTMLImageElement) => {
       const v = s as HTMLVideoElement;
@@ -270,21 +348,30 @@ export function CameraView() {
       return i.complete && i.naturalWidth > 0;
     };
 
-    const sendToWorker = async (source: HTMLVideoElement | HTMLImageElement) => {
-      const worker = workerRef.current as any;
-      if (!worker || worker.__inFlight() || !isUsable(source)) return;
-      worker.__setInFlight(true);
+    const sendToWorker = (source: HTMLVideoElement | HTMLImageElement) => {
+      const worker = workerRef.current;
+      if (!worker || inFlightRef.current || !isUsable(source)) return;
+      inFlightRef.current = true;
+      frameDirtyRef.current = false; // этот кадр уходит в обработку
+      // Таймстамп = mediaTime кадра (как в Wave 3): MediaPipe VIDEO точнее сглаживает
+      // по времени контента. В фото-режиме mediaTime не растёт -> performance.now().
+      const ts = modeRef.current === 'camera'
+        ? Math.round(mediaTimeRef.current * 1000)
+        : Math.round(performance.now());
       try {
-        const bitmap = await createImageBitmap(source, {
-          resizeWidth: INFERENCE_SIZE,
-          resizeHeight: INFERENCE_SIZE,
-          resizeQuality: 'low',
-        });
-        worker.postMessage({ type: 'segment', bitmap, timestamp: tick++ * 33 }, [bitmap]);
+        const id = grabPixels(source); // без createImageBitmap (не течёт на iOS)
+        worker.postMessage(
+          { type: 'segment', pixels: id.data.buffer, width: id.width, height: id.height, timestamp: ts },
+          [id.data.buffer],
+        );
+        // watchdog: если ответа нет 1500 мс — снимаем замок, иначе пайплайн залипнет.
+        if (watchdogRef.current) clearTimeout(watchdogRef.current);
+        watchdogRef.current = setTimeout(() => { inFlightRef.current = false; }, 1500);
       } catch {
-        worker.__setInFlight(false);
+        inFlightRef.current = false;
       }
     };
+    sendSegRef.current = sendToWorker; // для coalescing из worker.onmessage
 
     const onFrame = () => {
       const src: HTMLVideoElement | HTMLImageElement =
@@ -294,19 +381,47 @@ export function CameraView() {
       if (!isUsable(src)) return; // ещё нет ни кадра камеры, ни фото — нечего рисовать
 
       const p = presetRef.current;
-      const isPastel = intensityRef.current === 'pastel';
-      // Pastel использует отдельный (реальный из AR-API) пастельный цвет.
-      renderer.setColor(hexToRgb(isPastel && p.pastelHex ? p.pastelHex : p.hex));
+      // Цвет оттенка один на оба режима; Pastel отличается силой/насыщенностью
+      // (INTENSITY_PARAMS), а не отдельным hex — отдельных pastel-данных нет.
+      renderer.setColor(hexToRgb(p.hex));
       const ip = INTENSITY_PARAMS[intensityRef.current];
       renderer.setIntensity(ip.strength, ip.satScale);
       // LUT отключён: фото-рампы выцветают на свету и оттенок читается неверно.
       // Используем HSL-метод с насыщенным цветом оттенка (см. шейдер).
       renderer.setLutRow(-1);
       renderer.setMirror(modeRef.current === 'camera');
-      renderer.setSplit(splitRef.current ? splitPosRef.current : -1);
+      // Буфер теперь в аспекте сцены (cover делается в шейдере), поэтому output
+      // uv.x == доля сцены: позиция делителя идёт напрямую, без пересчёта аспекта.
+      renderer.setSplit(splitRef.current ? splitFracRef.current : -1);
 
       renderer.render(src);
+      // Регистрируем свежий кадр для latest-wins coalescing и пробуем отправить.
+      latestSourceRef.current = src;
+      frameDirtyRef.current = true;
       void sendToWorker(src);
+
+      // Кадр в face-воркер (борода) — троттлинг ~4 Гц, инференс полностью вне main.
+      const fw = faceWorkerRef.current;
+      const tNow = performance.now();
+      if (fw && !faceInFlightRef.current && tNow - lastFaceSend >= FACE_DETECT_INTERVAL_MS) {
+        lastFaceSend = tNow;
+        faceInFlightRef.current = true;
+        const fts = modeRef.current === 'camera'
+          ? Math.round(mediaTimeRef.current * 1000)
+          : Math.round(tNow);
+        try {
+          const id = grabPixels(src); // без createImageBitmap (не течёт на iOS)
+          fw.postMessage(
+            { type: 'detect', pixels: id.data.buffer, width: id.width, height: id.height, timestamp: fts },
+            [id.data.buffer],
+          );
+          // watchdog: если воркер не ответит — снимаем замок (борода не вечный приоритет)
+          if (faceWatchdogRef.current) clearTimeout(faceWatchdogRef.current);
+          faceWatchdogRef.current = setTimeout(() => { faceInFlightRef.current = false; }, 2000);
+        } catch {
+          faceInFlightRef.current = false;
+        }
+      }
 
       // Этап 1 (exclusion-маска бороды) теперь считается в ОТДЕЛЬНОМ цикле через
       // requestIdleCallback (см. эффект ниже) — detectForVideo синхронный и тяжёлый,
@@ -321,15 +436,16 @@ export function CameraView() {
       }
     };
 
-    // Драйвер цикла: для живой камеры — requestVideoFrameCallback (привязка к
-    // реальной частоте кадров видео, как требует бриф), иначе (фото/нет rVFC) —
-    // requestAnimationFrame.
+    // Драйвер цикла: requestVideoFrameCallback для живой камеры (рендер ровно на
+    // каждый новый кадр видео — плавно, без джиттера от рассинхрона), иначе rAF
+    // (фото-режим / нет rVFC). rAF-вариант давал «дёрганость», т.к. рендер не был
+    // синхронизирован с кадрами камеры.
     const hasRVFC = typeof (video as any).requestVideoFrameCallback === 'function';
-    const loop = () => {
+    const loop = (_now?: number, meta?: { mediaTime?: number }) => {
       if (cancelled) return;
+      // mediaTime кадра из rVFC — таймстамп для segmentForVideo (Wave 3).
+      if (meta && typeof meta.mediaTime === 'number') mediaTimeRef.current = meta.mediaTime;
       onFrame();
-      // Камера играет -> rVFC (привязка к частоте кадров видео). Иначе -> rAF
-      // (фото-режим / камера ещё не запущена). Цикл всегда жив.
       if (modeRef.current === 'camera' && hasRVFC && video.readyState >= 2 && !video.paused) {
         (video as any).requestVideoFrameCallback(loop);
       } else {
@@ -344,110 +460,82 @@ export function CameraView() {
     };
   }, []);
 
-  // --- Этап 6: exclusion-маска бороды в отдельном цикле (вне рендер-кадра). ---
-  // detectForVideo синхронный и тяжёлый — раньше он крутился внутри rVFC-колбэка
-  // и блокировал drawArrays. Выносим в requestIdleCallback (фолбэк setTimeout) и
-  // троттлим до ~6 раз/сек: борода двигается медленно, чаще не нужно, а рендер
-  // больше не ждёт инференс лэндмарков.
-  useEffect(() => {
-    const video = videoRef.current!;
-    let cancelled = false;
-    let faceTick = 0;
-    let lastRun = 0;
-    let idleHandle = 0;
-    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-    const MIN_INTERVAL = 160; // мс между детектами (~6 раз/сек)
-    const hasIdle = typeof (window as any).requestIdleCallback === 'function';
+  // exclusion-маска бороды теперь считается во ВТОРОМ воркере: кадр отправляется
+  // из onFrame (троттлинг + faceInFlightRef), результат приходит в onmessage
+  // выше. На главном потоке инференса больше нет.
 
-    const isUsable = (s: HTMLVideoElement | HTMLImageElement) => {
-      const v = s as HTMLVideoElement;
-      const i = s as HTMLImageElement;
-      if (v.tagName === 'VIDEO') return v.readyState >= 2 && v.videoWidth > 0;
-      return i.complete && i.naturalWidth > 0;
-    };
-    const pickSource = (): HTMLVideoElement | HTMLImageElement =>
-      modeRef.current === 'image' && imgRef.current?.complete ? imgRef.current : video;
-
-    const runDetect = () => {
-      if (cancelled) return;
-      const now = performance.now();
-      const fb = faceBuilderRef.current;
-      const src = pickSource();
-      if (fb && src && isUsable(src) && now - lastRun >= MIN_INTERVAL) {
-        lastRun = now;
-        try {
-          const ex = fb.buildJawExclusion(src, faceTick++ * 40);
-          exclusionRef.current = ex;
-          let px = 0;
-          if (ex) for (let k = 0; k < ex.length; k++) if (ex[k] > 0) px++;
-          (window as any).__face = { stage: 'detect', face: !!ex, beardPx: px };
-        } catch (e) {
-          exclusionRef.current = null;
-          (window as any).__face = { stage: 'detect-error', error: String(e) };
-        }
-      }
-      schedule();
-    };
-
-    const schedule = () => {
-      if (cancelled) return;
-      if (hasIdle) {
-        idleHandle = (window as any).requestIdleCallback(runDetect, { timeout: 250 });
-      } else {
-        timeoutHandle = setTimeout(runDetect, MIN_INTERVAL);
-      }
-    };
-    schedule();
-
-    return () => {
-      cancelled = true;
-      if (hasIdle && idleHandle && typeof (window as any).cancelIdleCallback === 'function') {
-        (window as any).cancelIdleCallback(idleHandle);
-      }
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-    };
+  // Общий cleanup при размонтировании: камера, таймер снимка, blob-URL.
+  useEffect(() => () => {
+    cameraHandleRef.current?.stop();
+    cameraHandleRef.current = null;
+    if (captureTimerRef.current) {
+      clearInterval(captureTimerRef.current);
+      captureTimerRef.current = null;
+    }
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current);
+      blobUrlRef.current = null;
+    }
   }, []);
 
-  // Останавливаем камеру при размонтировании.
-  useEffect(() => () => cameraHandleRef.current?.stop(), []);
-
-  // Запуск камеры по жесту пользователя (кнопка Start). Вызов getUserMedia
-  // прямо в обработчике клика гарантирует промпт (важно для iOS Safari).
-  // Линию split двигаем ТОЛЬКО во время активного перетаскивания (нажал->ведёшь),
-  // иначе случайные pointermove у сцены сдвигали её. canvas показан через
-  // object-fit: cover, поэтому позицию пальца переводим в координату кадра (uv.x).
-  const splitDragging = useRef(false);
-  const updateSplitPos = (e: React.PointerEvent) => {
-    const el = canvasRef.current;
-    if (!el || !el.width || !el.height) return;
-    const rect = el.getBoundingClientRect();
-    const f = (e.clientX - rect.left) / rect.width;
-    const boxAspect = rect.width / rect.height;
-    const fbAspect = el.width / el.height;
-    const uvx = fbAspect > boxAspect ? 0.5 + (f - 0.5) * (boxAspect / fbAspect) : f;
-    splitPosRef.current = Math.max(0, Math.min(1, uvx));
+  // Перетаскивание делителя: обработчики висят на самой РУЧКЕ (а не на всей
+  // сцене), с pointer capture — поэтому тапы по палитре/кнопкам и закрытие
+  // делителя больше не двигают линию. Позицию ведём как долю видимой области.
+  const dividerDragging = useRef(false);
+  const updateDivider = (clientX: number) => {
+    const cv = canvasRef.current;
+    if (!cv) return;
+    const rect = cv.getBoundingClientRect();
+    let f = (clientX - rect.left) / rect.width;
+    f = Math.max(0, Math.min(1, f));
+    splitFracRef.current = f;
+    if (dividerRef.current) dividerRef.current.style.left = `${f * 100}%`;
   };
-  const onSplitDown = (e: React.PointerEvent) => {
-    if (!splitRef.current) return;
-    splitDragging.current = true;
-    updateSplitPos(e);
+  const onDividerDown = (e: React.PointerEvent) => {
+    e.preventDefault();
+    dividerDragging.current = true;
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    updateDivider(e.clientX);
   };
-  const onSplitMove = (e: React.PointerEvent) => {
-    if (!splitRef.current || !splitDragging.current) return;
-    updateSplitPos(e);
+  const onDividerMove = (e: React.PointerEvent) => {
+    if (!dividerDragging.current) return;
+    updateDivider(e.clientX);
   };
-  const onSplitUp = () => { splitDragging.current = false; };
+  const onDividerUp = (e: React.PointerEvent) => {
+    dividerDragging.current = false;
+    (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+  };
 
   // Загрузить картинку (URL/файл) как источник вместо камеры.
   const loadPhotoSrc = (src: string) => {
-    const img = imgRef.current!;
-    img.onload = () => { processorRef.current.reset(); setMode('image'); };
+    const img = imgRef.current;
+    if (!img) return;
+    const myReq = ++photoReqRef.current; // токен против гонки onload/onerror
+    // revoke предыдущего blob-URL (только blob:, не /test-model.jpg и т.п.)
+    if (blobUrlRef.current && blobUrlRef.current !== src) {
+      URL.revokeObjectURL(blobUrlRef.current);
+      blobUrlRef.current = null;
+    }
+    if (src.startsWith('blob:')) blobUrlRef.current = src;
+    img.onload = () => {
+      if (myReq !== photoReqRef.current) return; // уже запросили другое фото
+      processorRef.current.reset();
+      setMode('image');
+    };
+    img.onerror = () => {
+      if (myReq !== photoReqRef.current) return;
+      setStatus('error');
+      setErrorMsg('Не удалось загрузить изображение.');
+    };
     img.src = src;
   };
 
   const beginCamera = async () => {
     const video = videoRef.current;
     if (!video) return;
+    // Останавливаем прежний поток перед новым стартом (иначе утечка треков).
+    cameraHandleRef.current?.stop();
+    cameraHandleRef.current = null;
     try {
       cameraHandleRef.current = await startCamera(video);
       setMode('camera');
@@ -472,24 +560,40 @@ export function CameraView() {
   }, [ready, mode]);
 
   // --- Кнопка фото: отсчёт + фриз, с защитой от мультитапа ---
-  const captureBusy = useRef(false);
+  // Снимок берём через readPixels (preserveDrawingBuffer снят): просим у рендерера
+  // 2D-canvas с пикселями текущего кадра и кропаем его.
+  const doCapture = async () => {
+    try {
+      const cap = await rendererRef.current?.requestCapture();
+      if (cap) {
+        setCaptured(cropPortrait(cap, presetRef.current));
+        setShowGuide(!guideSeenRef.current); // гайд «HOW TO SAVE» один раз за сессию
+        guideSeenRef.current = true;
+      }
+    } catch (err) {
+      console.warn('[capture] не удалось снять кадр:', err);
+    } finally {
+      captureBusyRef.current = false;
+      setCaptureBusy(false);
+    }
+  };
   const handleCapture = () => {
     // guard от повторных нажатий (фикс бага референса с накладывающимися отсчётами)
-    if (captureBusy.current || (status !== 'ready' && mode !== 'image')) return;
-    captureBusy.current = true;
+    if (captureBusyRef.current || (status !== 'ready' && mode !== 'image')) return;
+    captureBusyRef.current = true;
+    setCaptureBusy(true);
     let n = CAPTURE_COUNTDOWN;
     setCountdown(n);
-    const timer = setInterval(() => {
+    captureTimerRef.current = setInterval(() => {
       n -= 1;
       setCountdown(n);
       if (n <= 0) {
-        clearInterval(timer);
+        if (captureTimerRef.current) {
+          clearInterval(captureTimerRef.current);
+          captureTimerRef.current = null;
+        }
         setCountdown(0);
-        setCaptured(cropPortrait(canvasRef.current!, preset));
-        // гайд «HOW TO SAVE» показываем только в первый раз за сессию
-        setShowGuide(!guideSeenRef.current);
-        guideSeenRef.current = true;
-        captureBusy.current = false;
+        void doCapture();
       }
     }, 1000);
   };
@@ -509,16 +613,25 @@ export function CameraView() {
 
       {/* сцена: ограниченная по ширине вертикальная «карточка» как в референсе.
           canvas + все оверлеи позиционируются относительно неё. */}
-      <div
-        className="stage"
-        onPointerDown={onSplitDown}
-        onPointerMove={onSplitMove}
-        onPointerUp={onSplitUp}
-        onPointerLeave={onSplitUp}
-        onPointerCancel={onSplitUp}
-      >
+      <div className="stage">
       {/* вывод */}
       <canvas ref={canvasRef} className="output-canvas" />
+
+      {/* Делитель before/after: видимая линия + круглая ручка с зоной захвата.
+          Drag c pointer capture — только на самой ручке. */}
+      {split && (
+        <div
+          className="split-divider"
+          ref={dividerRef}
+          style={{ left: `${splitFracRef.current * 100}%` }}
+          onPointerDown={onDividerDown}
+          onPointerMove={onDividerMove}
+          onPointerUp={onDividerUp}
+          onPointerCancel={onDividerUp}
+        >
+          <div className="split-handle" />
+        </div>
+      )}
 
       {captured && (
         <div className="capture-screen">
@@ -560,9 +673,9 @@ export function CameraView() {
           onClick={() => {
             const next = !splitRef.current;
             splitRef.current = next;          // синхронно -> следующий кадр сразу видит off
-            if (next) splitPosRef.current = 0.5;
-            splitDragging.current = false;
-            setSplit(next);                   // только для active-класса кнопки
+            if (next) splitFracRef.current = 0.5;
+            dividerDragging.current = false;
+            setSplit(next);                   // монтирует/снимает делитель + active-класс
           }}
         >
           <IconSplit />
@@ -572,7 +685,7 @@ export function CameraView() {
           <input type="file" accept="image/*" onChange={handleUpload} hidden />
         </label>
         {mode === 'image' && (
-          <button className="rail-btn" title="Вернуться к камере" onClick={() => { setMode('camera'); void beginCamera(); }}>
+          <button className="rail-btn" title="Вернуться к камере" onClick={() => { void beginCamera(); }}>
             <IconCameraFlip />
           </button>
         )}
@@ -592,7 +705,7 @@ export function CameraView() {
         <button
           className="capture-btn"
           onClick={handleCapture}
-          disabled={(status !== 'ready' && mode !== 'image') || captureBusy.current}
+          disabled={(status !== 'ready' && mode !== 'image') || captureBusy}
         >
           <IconCamera />
         </button>
