@@ -12,6 +12,8 @@ import {
   MASK_EMA_ALPHA,
   EMA_ALPHA_STILL,
   EMA_MOTION_GAIN,
+  EMA_REF_DT_MS,
+  EMA_DT_RATIO_MAX,
 } from '../config';
 
 export class MaskProcessor {
@@ -33,7 +35,7 @@ export class MaskProcessor {
    *   alpha = clamp(STILL + motion*GAIN, STILL, MAX)
    * и применяем  mask_t = alpha * current + (1 - alpha) * prev.
    */
-  private applyEMA(current: Uint8Array): Uint8Array {
+  private applyEMA(current: Uint8Array, dtMs: number): Uint8Array {
     if (!this.prev || this.prev.length !== current.length) {
       this.prev = Float32Array.from(current);
       // первый кадр — отдать как есть, копировать в out
@@ -63,6 +65,17 @@ export class MaskProcessor {
     let a = EMA_ALPHA_STILL + motion * EMA_MOTION_GAIN;
     if (a < EMA_ALPHA_STILL) a = EMA_ALPHA_STILL;
     if (a > MASK_EMA_ALPHA) a = MASK_EMA_ALPHA;
+
+    // 2b) Framerate-компенсация: удерживаем постоянную времени EMA в МИЛЛИСЕКУНДАХ,
+    //     а не в кадрах. При редких масках (Android-CPU) alpha растёт, чтобы лаг в
+    //     реальном времени не раздувался. dtMs<=0 (первый/некорректный) -> без правки.
+    if (dtMs > 0) {
+      let ratio = dtMs / EMA_REF_DT_MS;
+      if (ratio > EMA_DT_RATIO_MAX) ratio = EMA_DT_RATIO_MAX;
+      if (ratio < 1) ratio = 1; // быстрее опорной частоты не «недосглаживаем»
+      a = 1 - Math.pow(1 - a, ratio);
+      if (a > MASK_EMA_ALPHA) a = MASK_EMA_ALPHA;
+    }
     const ia = 1 - a;
 
     // 3) Сглаживание.
@@ -81,13 +94,13 @@ export class MaskProcessor {
    */
   process(
     rawHair: Uint8Array,
-    opts: { smooth?: boolean; exclusion?: Uint8Array | null } = {},
+    opts: { smooth?: boolean; exclusion?: Uint8Array | null; dtMs?: number } = {},
   ): Uint8Array {
     let mask = rawHair;
 
     // Этап 2: адаптивное темпоральное сглаживание (по чистой маске волос).
     if (opts.smooth) {
-      mask = this.applyEMA(mask);
+      mask = this.applyEMA(mask, opts.dtMs ?? EMA_REF_DT_MS);
     }
 
     // Этап 1: вычитаем зону бороды/лица — ПОСЛЕ сглаживания.

@@ -36,6 +36,18 @@
   const FilesetResolver = vision.FilesetResolver;
 
   let segmenter: any = null;
+  let fileset: any = null;
+
+  // Лестница фолбэка. На многих Android GPU-путь МУЛЬТИКЛАССА в WebGL/воркере
+  // отдаёт 0 масок при ожидаемых 6 ("confidence_mask_count 0 vs 6",
+  // "norm_rect was not ok"). При сбое инференса спускаемся на ступень ниже:
+  //   1) мультиклас @ GPU  — лучшая якість маски (десктоп/iOS, исправные Android);
+  //   2) hair-модель @ GPU — её GPU-делегат устойчив; БЫСТРО и без CPU;
+  //   3) hair-модель @ CPU — крайний случай, лишь бы не падать красным экраном.
+  // GPU остаётся приоритетом: на CPU сходим только если и hair@GPU не поднялся.
+  type Rung = { model: string; delegate: 'GPU' | 'CPU' };
+  let ladder: Rung[] = [];
+  let rung = 0;
 
   const offscreen = new OffscreenCanvas(INFERENCE_SIZE, INFERENCE_SIZE);
   const offCtx = offscreen.getContext('2d', { willReadFrequently: true })!;
@@ -49,24 +61,73 @@
     (self as any).postMessage(msg, transfer ?? []);
   }
 
-  async function init(modelPath: string) {
+  // Короткая метка активной ступени для диагностики на экране.
+  function backendLabel(): string {
+    const c = ladder[rung];
+    if (!c) return '';
+    const m = c.model.indexOf('hair') >= 0 ? 'hair' : 'multi';
+    return m + '@' + c.delegate;
+  }
+
+  async function createSegmenter() {
+    if (!fileset) fileset = await FilesetResolver.forVisionTasks(WASM_ROOT);
+    if (segmenter) {
+      try { segmenter.close?.(); } catch {}
+      segmenter = null;
+    }
+    const cfg = ladder[rung];
+    segmenter = await ImageSegmenter.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: cfg.model, delegate: cfg.delegate },
+      runningMode: 'VIDEO',
+      // Мягкая (confidence) маска класса hair — без бинарного порога (край не
+      // «кипит»). categoryMask НЕ запрашиваем: её argmax — лишняя работа каждый
+      // инференс (грелся GPU), а используем мы только confidenceMasks[1].
+      // Обе модели (мультиклас и hair) держат hair на индексе 1.
+      outputCategoryMask: false,
+      outputConfidenceMasks: true,
+    });
+  }
+
+  // Спуститься на следующую ступень лестницы после сбоя текущей и пересоздать
+  // сегментатор. Возвращает true, если переключение произошло (есть смысл
+  // повторить инференс). Когда ступени кончились — false (выше отдадим ошибку).
+  async function fallbackNext(): Promise<boolean> {
+    if (rung >= ladder.length - 1) return false;
+    rung++;
+    lastTs = -1;
     try {
-      const fileset = await FilesetResolver.forVisionTasks(WASM_ROOT);
-      segmenter = await ImageSegmenter.createFromOptions(fileset, {
-        baseOptions: { modelAssetPath: modelPath, delegate: 'GPU' },
-        runningMode: 'VIDEO',
-        // Мягкая (confidence) маска класса hair — без бинарного порога (край не
-        // «кипит»). categoryMask НЕ запрашиваем: её argmax — лишняя работа каждый
-        // инференс (грелся GPU), а используем мы только confidenceMasks[1].
-        outputCategoryMask: false,
-        outputConfidenceMasks: true,
-      });
+      await createSegmenter();
+      post({ type: 'info', message: `segmenter fallback -> ${ladder[rung].model} @ ${ladder[rung].delegate}` });
+      return true;
+    } catch (err) {
+      // Эта ступень тоже не создалась — пробуем спуститься ещё ниже.
+      return fallbackNext();
+    }
+  }
+
+  async function init(modelPath: string, hairModelPath?: string) {
+    // Собираем лестницу. Если hair-модель не передали — деградируем к
+    // прежнему поведению (мультиклас GPU -> CPU).
+    const hair = hairModelPath || modelPath;
+    ladder = [
+      { model: modelPath, delegate: 'GPU' },
+      { model: hair, delegate: 'GPU' },
+      { model: hair, delegate: 'CPU' },
+    ];
+    rung = 0;
+    try {
+      await createSegmenter();
       // Прогрев на холостом кадре: ПЕРВЫЙ инференс компилирует GPU-кернелы —
       // делаем это сейчас, на экране загрузки, чтобы при старте камеры не было
       // лага. 'ready' шлём только после прогрева (с подстраховкой по таймауту).
       warmupThenReady();
     } catch (err) {
-      post({ type: 'error', message: String(err) });
+      // Сбой создания на текущей ступени — спускаемся ниже прежде, чем сдаваться.
+      if (await fallbackNext()) {
+        warmupThenReady();
+      } else {
+        post({ type: 'error', message: String(err) });
+      }
     }
   }
 
@@ -75,7 +136,7 @@
     const finish = () => {
       if (done) return;
       done = true;
-      post({ type: 'ready' });
+      post({ type: 'ready', backend: backendLabel() });
     };
     try {
       offCtx.clearRect(0, 0, INFERENCE_SIZE, INFERENCE_SIZE);
@@ -86,8 +147,13 @@
       });
       // если колбэк не пришёл (маловероятно) — всё равно отдаём готовность
       setTimeout(finish, 2500);
-    } catch {
-      finish();
+    } catch (err) {
+      // Синхронный сбой инференса (типичный Android-кейс с мультиклас@GPU) —
+      // спускаемся на ступень ниже (hair@GPU) и греемся заново.
+      fallbackNext().then((ok) => {
+        if (ok && !done) warmupThenReady();
+        else finish();
+      });
     }
   }
 
@@ -105,8 +171,12 @@
     if (ts <= lastTs) ts = lastTs + 1;
     lastTs = ts;
 
+    const t0 = performance.now();
     try {
       segmenter.segmentForVideo(offscreen, ts, (result: any) => {
+        // t1: инференс завершён (колбэк). Разница t1−t0 ≈ чистый инференс;
+        // дальше идёт readback маски (getAsFloat32Array — GPU→CPU столл) + обработка.
+        const t1 = performance.now();
         // Предпочитаем мягкую confidence-маску класса hair: вероятность 0..1
         // без порога. Это убирает бинарное «мерцание» на границе прядей.
         const confMasks = result.confidenceMasks;
@@ -114,14 +184,21 @@
         let wrote = false;
 
         if (hairConf) {
-          const probs: Float32Array = hairConf.getAsFloat32Array();
+          // КРИТИЧНО для перфа: читаем маску как UINT8, а не Float32. Float32-
+          // readback на мобильном WebGL идёт медленным путём (RGBA32F) и стопорит
+          // общий GPU — это и был «100мс» (rd ~75мс). Uint8 — вчетверо меньше
+          // данных и быстрый RGBA8-путь. Для мягкой маски качество идентично:
+          // мы всё равно квантуем выход в 8 бит. confidence приходит как 0..255.
+          const probs: Uint8Array = hairConf.getAsUint8Array();
           if (maskBuffer.length !== probs.length) maskBuffer = new Uint8Array(probs.length);
+          // Пороги smoothstep в 0..255 (0.12*255≈31, ширина 0.76*255≈194).
+          const LO = 31, INV = 1 / 194;
           for (let i = 0; i < probs.length; i++) {
-            // Мягкий контраст вероятности: smoothstep(0.12,0.88) гасит лишь самый
+            // Мягкий контраст вероятности: smoothstep гасит лишь самый
             // низкоуверенный спекл фона, но СОХРАНЯЕТ широкий градиент на переходе
             // волосы↔фон — чтобы край перекраски был мягким, а не резким (особенно
             // заметно на ярких цветах). Без бинаризации.
-            let t = (probs[i] - 0.12) / 0.76;
+            let t = (probs[i] - LO) * INV;
             t = t < 0 ? 0 : t > 1 ? 1 : t;
             const p = t * t * (3.0 - 2.0 * t);
             const v = p * 255.0;
@@ -143,16 +220,31 @@
 
         if (!wrote) return;
         const out = maskBuffer.slice();
-        post({ type: 'mask', data: out, width: INFERENCE_SIZE, height: INFERENCE_SIZE }, [out.buffer]);
+        const now = performance.now();
+        post(
+          { type: 'mask', data: out, width: INFERENCE_SIZE, height: INFERENCE_SIZE,
+            infMs: t1 - t0, readMs: now - t1, backend: backendLabel() },
+          [out.buffer],
+        );
       });
     } catch (err) {
-      post({ type: 'error', message: 'segmentForVideo: ' + String(err) });
+      // Делегат упал на реальном кадре (Android: mask count 0 vs 6 /
+      // norm_rect not ok) — спускаемся на следующую ступень (hair@GPU, затем
+      // hair@CPU) и повторяем этот кадр. Ступени кончились — отдаём ошибку.
+      if (rung < ladder.length - 1) {
+        fallbackNext().then((ok) => {
+          if (ok) segment(pixels, w, h, timestamp);
+          else post({ type: 'error', message: 'segmentForVideo: ' + String(err) });
+        });
+      } else {
+        post({ type: 'error', message: 'segmentForVideo: ' + String(err) });
+      }
     }
   }
 
   self.onmessage = (e: MessageEvent) => {
     const msg = e.data;
-    if (msg.type === 'init') init(msg.modelPath);
+    if (msg.type === 'init') init(msg.modelPath, msg.hairModelPath);
     else if (msg.type === 'segment') segment(msg.pixels, msg.width, msg.height, msg.timestamp);
   };
 })();

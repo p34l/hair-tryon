@@ -14,7 +14,7 @@ import { IntensityToggle } from './IntensityToggle';
 import { LegalOverlay } from './LegalOverlay';
 import {
   PRESETS, INFERENCE_SIZE, INTENSITY_PARAMS, MODEL, LOGO,
-  hexToRgb, CAPTURE_COUNTDOWN, FACE_DETECT_INTERVAL_MS,
+  hexToRgb, CAPTURE_COUNTDOWN, FACE_DETECT_INTERVAL_MS, ENABLE_BEARD_EXCLUSION,
 } from '../config';
 import type { Intensity, ColorPreset, WorkerResponse } from '../types';
 
@@ -158,12 +158,18 @@ export function CameraView() {
   const frameDirtyRef = useRef(false);
   const sendSegRef = useRef<((s: HTMLVideoElement | HTMLImageElement) => void) | null>(null);
   const mediaTimeRef = useRef(0); // mediaTime кадра из rVFC для segmentForVideo
+  const lastMaskAtRef = useRef(0); // время прихода прошлой маски (dt для EMA-компенсации)
+  const backendRef = useRef(''); // активная ступень сегментации (multi@GPU / hair@GPU / hair@CPU)
+  const infMsRef = useRef(0); // сглаженное время инференса сегментации, мс
+  const readMsRef = useRef(0); // сглаженное время readback+обработки маски, мс
+  const maskCountRef = useRef(0); // счётчик масок за текущую секунду (для Hz)
 
   const [status, setStatus] = useState<Status>('loading');
   const [errorMsg, setErrorMsg] = useState('');
   const [preset, setPreset] = useState<ColorPreset>(PRESETS[0]);
   const [intensity, setIntensity] = useState<Intensity>('intense');
   const [fps, setFps] = useState(0);
+  const [dbg, setDbg] = useState(''); // диагностическая строка (бекенд · инференс · маски/с)
   const [showDisclaimer, setShowDisclaimer] = useState(true);
   const [showCameraPopup, setShowCameraPopup] = useState(true);
   const [showLegal, setShowLegal] = useState(false);
@@ -230,14 +236,28 @@ export function CameraView() {
       const msg = e.data;
       if (msg.type === 'ready') {
         setModelReady(true); // модель сегментации загружена -> можно просить камеру
+        if ((msg as any).backend) backendRef.current = (msg as any).backend;
       } else if (msg.type === 'error') {
         clearInFlight();
         setStatus('error');
         setErrorMsg(msg.message ?? 'Ошибка воркера');
       } else if (msg.type === 'mask') {
         clearInFlight();
+        // Фактический интервал между готовыми масками — для framerate-компенсации
+        // EMA (на Android-CPU маски реже, и без этого EMA добавляет лишний лаг).
+        const nowMask = performance.now();
+        const dtMs = lastMaskAtRef.current > 0 ? nowMask - lastMaskAtRef.current : 0;
+        lastMaskAtRef.current = nowMask;
+        // Диагностика: бекенд, время инференса (EMA) и счётчик масок за секунду.
+        if ((msg as any).backend) backendRef.current = (msg as any).backend;
+        const inf = (msg as any).infMs;
+        if (typeof inf === 'number') infMsRef.current = infMsRef.current * 0.8 + inf * 0.2;
+        const rd = (msg as any).readMs;
+        if (typeof rd === 'number') readMsRef.current = readMsRef.current * 0.8 + rd * 0.2;
+        maskCountRef.current++;
         const processed = processorRef.current.process(msg.data, {
           smooth: true, // EMA-сглаживание (этап 2)
+          dtMs, // framerate-компенсация постоянной времени EMA
           // вычитаем зону бороды/нижней части лица (этап 1) — всегда включено
           exclusion: exclusionRef.current,
         });
@@ -253,6 +273,8 @@ export function CameraView() {
     worker.postMessage({
       type: 'init',
       modelPath: new URL(MODEL.segmenter, location.origin).href,
+      // GPU-фолбэк для Android, где мультиклас на GPU падает (см. config).
+      hairModelPath: new URL(MODEL.segmenterHair, location.origin).href,
       wasmRoot: MODEL.wasmRoot,
     });
 
@@ -270,6 +292,9 @@ export function CameraView() {
   // requestIdleCallback) и блокировал рендер — главная причина просадки FPS на
   // iPhone. Теперь инференс и растеризация маски целиком в воркере.
   useEffect(() => {
+    // Второй граф (борода) по умолчанию ВЫКЛ на слабком GPU — освобождаем GPU
+    // под рендер сегментатора (см. ENABLE_BEARD_EXCLUSION в config).
+    if (!ENABLE_BEARD_EXCLUSION) return;
     const worker = new Worker(
       new URL('../pipeline/faceLandmarks.worker.ts', import.meta.url),
     );
@@ -430,7 +455,12 @@ export function CameraView() {
       frameCount++;
       const now = performance.now();
       if (now - fpsT0 >= 1000) {
-        setFps(Math.round((frameCount * 1000) / (now - fpsT0)));
+        const secs = (now - fpsT0) / 1000;
+        setFps(Math.round(frameCount / secs));
+        // Диагностика: бекенд · время инференса · частота масок (Гц).
+        const maskHz = Math.round(maskCountRef.current / secs);
+        setDbg(`${backendRef.current || '…'} · inf ${Math.round(infMsRef.current)} rd ${Math.round(readMsRef.current)}ms · ${maskHz}Hz`);
+        maskCountRef.current = 0;
         frameCount = 0;
         fpsT0 = now;
       }
@@ -691,8 +721,8 @@ export function CameraView() {
         )}
       </div>
 
-      {/* FPS */}
-      <div className="fps">{fps} FPS</div>
+      {/* FPS + диагностика (бекенд · инференс · частота масок) */}
+      <div className="fps">{fps} FPS{dbg ? ` · ${dbg}` : ''}</div>
 
       {/* правый рейл: Intense/Pastel по центру (на уровне боковых кнопок слева) */}
       <div className="right-rail">

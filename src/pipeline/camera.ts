@@ -24,10 +24,26 @@ export async function startCamera(video: HTMLVideoElement): Promise<CameraHandle
       // 720p — чёткая картинка. Инференс всё равно на 256, рендер кэпится по высоте.
       width: { ideal: 1280 },
       height: { ideal: 720 },
-      // 30 к/с — стабильнее; rVFC привязан к реальной частоте кадров.
-      frameRate: { ideal: 30 },
+      // frameRate.min КРИТИЧЕН на Android: без нижней границы сенсор в комнатном
+      // свете (особенно при движении/тёмной сцене) удлиняет ВЫДЕРЖКУ, чтобы
+      // вытянуть яркость, а длинная выдержка физически режет FPS (1/10с → 10 к/с —
+      // ровно симптом «20→10 при движении головой»). Требуя min, заставляем камеру
+      // держать частоту и компенсировать яркость усилением (ISO/gain), а не временем.
+      frameRate: { min: 24, ideal: 30 },
     },
   });
+
+  // Подстраховка: на части Android начальные constraints игнорируются, но
+  // applyConstraints на живом треке honor'ится. Просим держать кадровую частоту;
+  // ошибки/неподдержку молча глотаем (тогда остаётся поведение по умолчанию).
+  const track = stream.getVideoTracks()[0];
+  if (track) {
+    try {
+      await track.applyConstraints({ frameRate: { min: 24, ideal: 30 } } as MediaTrackConstraints);
+    } catch {
+      /* устройство не даёт менять frameRate на лету — ок */
+    }
+  }
 
   video.srcObject = stream;
   video.muted = true;
