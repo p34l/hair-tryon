@@ -28,6 +28,11 @@ const IS_IOS =
   (/iP(hone|ad|od)/.test(navigator.userAgent) ||
     (/Mac/.test(navigator.userAgent) && navigator.maxTouchPoints > 1)); // iPadOS 13+
 
+// Интервал между инференсами (мс). ~12 Гц: маска держится стабильно, поэтому реже
+// — незаметно, но втрое легче по GPU и втрое медленнее iOS-утечка. Рендер при этом
+// каждый кадр (см. onFrame).
+const INFER_INTERVAL_MS = 80;
+
 // --- Графические иконки (currentColor) ---
 const IconCamera = () => (
   <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor"
@@ -154,6 +159,7 @@ export function CameraView() {
   const mediaTimeRef = useRef(0); // mediaTime кадра из rVFC для segmentForVideo
   const backendRef = useRef(''); // активная ступень сегментации (multi@GPU / hair@GPU / hair@CPU)
   const maskCountRef = useRef(0); // счётчик масок за текущую секунду (для Hz)
+  const lastInferRef = useRef(0); // время последнего инференса (throttle ~12 Гц)
   const prepMsRef = useRef(0); // EMA: подготовка входа (drawImage+getImageData), мс
   const infMsRef = useRef(0);  // EMA: инференс (segmentForVideo до колбэка), мс
   const rendMsRef = useRef(0); // EMA: наш рендер внутри колбэка, мс
@@ -210,8 +216,11 @@ export function CameraView() {
     // (getAsWebGLTexture) и идёт прямо в шейдер — без getAs*Array, без воркера,
     // без пересылки между потоками. Renderer уже создал webgl2-контекст на этом
     // canvas; сегментатор его переиспользует (опция canvas).
-    // usePixels=IS_IOS: на iOS маску берём пикселями (getAsWebGLTexture там течёт памятью).
-    const segmenter = new HairSegmenter(canvas, IS_IOS);
+    // usePixels=true: маску читаем пикселями (256², 64КБ) и заливаем в постоянную
+    // текстуру. При throttled-инференсе (~12 Гц) этот readback редкий, а рендер
+    // каждый кадр идёт из готовой текстуры. getAsWebGLTexture не используем — он на
+    // iOS течёт, а zero-readback всё равно не помог Android (рендер ждал инференс).
+    const segmenter = new HairSegmenter(canvas, true);
     segmenterRef.current = segmenter;
     let cancelled = false;
 
@@ -302,64 +311,47 @@ export function CameraView() {
       // uv.x == доля сцены: позиция делителя идёт напрямую, без пересчёта аспекта.
       renderer.setSplit(splitRef.current ? splitFracRef.current : -1);
 
-      // ZERO-READBACK: сегментируем и рендерим В ОДНОМ контексте. Маска приходит
-      // GPU-текстурой в синхронном колбэке segmentForVideo и сразу идёт в шейдер —
-      // никакого CPU-readback, воркера и пересылки. Рендер строго внутри колбэка:
-      // текстура маски валидна только там.
+      // РАЗВЯЗКА РЕНДЕРА И ИНФЕРЕНСА. Инференс — ТЯЖЁЛЫЙ (и греет iOS-утечку, и
+      // серіализуется с рендером на Android), поэтому гоняем его РЕДКО (~12 Гц), а
+      // рендер — КАЖДЫЙ кадр из ПОСТОЯННОЙ маски (renderer.maskTex). Маска держится
+      // стабильно, так что редкий инференс на глаз незаметен. Это:
+      //  • iOS: втрое меньше инференсов → втрое медленнее накопление утечки;
+      //  • Android: рендер не ждёт инференс → выше FPS.
       const seg = segmenterRef.current;
       const ts = modeRef.current === 'camera'
         ? Math.round(mediaTimeRef.current * 1000)
         : Math.round(performance.now());
-      if (seg) {
-        // Уменьшаем кадр и отдаём сегментатору CPU-пикселями (ImageData), не GPU-
-        // backed канвасом/видео — иначе MediaPipe на iOS течёт памятью (см. выше).
+      const nowT = performance.now();
+      if (seg && nowT - lastInferRef.current >= INFER_INTERVAL_MS) {
+        lastInferRef.current = nowT;
         const tA = performance.now();
-        // Источник кадра. Главное — захватить видеокадр ОДИН раз и отдать его и
-        // сегментатору, и рендеру (иначе двойной захват = два GPU-стопа, prep+rend):
-        //  • Android/прочие: один VideoFrame (zero-copy, WebCodecs) → оба аплоадят
-        //    из одной GPU-копии.
-        //  • iOS: VideoFrame/MSTP нет, плюс там утечка от GPU-источников — поэтому
-        //    сегментатору ImageData (CPU), рендеру — само <video>.
-        let segSource: TexImageSource;
-        let renderSource: HTMLVideoElement | HTMLImageElement | VideoFrame = src;
-        let vf: VideoFrame | null = null;
-        if (IS_IOS) {
-          segCtx.drawImage(src, 0, 0, SEG_SIZE, SEG_SIZE);
-          segSource = segCtx.getImageData(0, 0, SEG_SIZE, SEG_SIZE);
-        } else if (typeof VideoFrame !== 'undefined' && src instanceof HTMLVideoElement) {
-          vf = new VideoFrame(src, { timestamp: ts });
-          segSource = vf;
-          renderSource = vf;
-        } else {
-          segSource = src;
-        }
+        // Вход в сегментатор — уменьшенный 256² кадр. iOS: CPU-пиксели (ImageData)
+        // против утечки от GPU-источников; Android/прочие: сам canvas (drawImage'а
+        // достаточно, getImageData там лишний GPU-стоп).
+        segCtx.drawImage(src, 0, 0, SEG_SIZE, SEG_SIZE);
+        const segSource: TexImageSource = IS_IOS
+          ? segCtx.getImageData(0, 0, SEG_SIZE, SEG_SIZE)
+          : segCanvas;
         const tB = performance.now();
-        let tC = tB, tD = tB;
+        let tC = tB;
+        // Маску берём пикселями (usePixels=true) и заливаем в ПОСТОЯННУЮ текстуру —
+        // её рендер сэмплит каждый кадр, в т.ч. когда инференс не считался.
         seg.segment(segSource, ts, (payload) => {
-          tC = performance.now(); // инференс = tC - tB (колбэк синхронный)
-          if (payload?.tex) {
-            // Android: маска уже GPU-текстура — прямо в шейдер (zero-readback).
-            renderer.render(renderSource, { tex: payload.tex, w: payload.width, h: payload.height });
-            maskCountRef.current++;
-          } else if (payload?.data) {
-            // iOS: маска пикселями — заливаем в свою текстуру, потом обычный рендер.
+          tC = performance.now();
+          if (payload?.data) {
             renderer.updateMask(payload.data, payload.width, payload.height);
-            renderer.render(renderSource);
             maskCountRef.current++;
-          } else {
-            renderer.render(renderSource); // маски нет — только видео
           }
-          tD = performance.now(); // рендер = tD - tC
         });
-        vf?.close(); // освобождаем VideoFrame сразу после синхронного рендера
-        // EMA по стадиям: подготовка входа / инференс / рендер.
         prepMsRef.current = prepMsRef.current * 0.85 + (tB - tA) * 0.15;
         infMsRef.current = infMsRef.current * 0.85 + (tC - tB) * 0.15;
-        rendMsRef.current = rendMsRef.current * 0.85 + (tD - tC) * 0.15;
         backendRef.current = seg.backend;
-      } else {
-        renderer.render(src); // сегментатор ещё не готов — просто видео
       }
+
+      // Рендер — ВСЕГДА, каждый кадр, из последней (постоянной) маски.
+      const tR = performance.now();
+      renderer.render(src);
+      rendMsRef.current = rendMsRef.current * 0.85 + (performance.now() - tR) * 0.15;
 
       frameCount++;
       const now = performance.now();
@@ -368,7 +360,7 @@ export function CameraView() {
         setFps(Math.round(frameCount / secs));
         // Диагностика: бекенд · время инференса · частота масок (Гц).
         const maskHz = Math.round(maskCountRef.current / secs);
-        setDbg(`[v12] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
+        setDbg(`[v13·throttle] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
         maskCountRef.current = 0;
         frameCount = 0;
         fpsT0 = now;
