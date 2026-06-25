@@ -124,7 +124,7 @@ const SwatchSwiper = memo(function SwatchSwiper({
 export const ColorPicker = memo(function ColorPicker({ presets, selectedId, onSelect }: Props) {
   const selected = presets.find((p) => p.id === selectedId) ?? presets[0];
   const [open, setOpen] = useState(true);
-  const mock = boxMockup(selected); void mock; // (мокап временно не показываем — тест)
+  const mock = boxMockup(selected);
 
   // ПРЕДзагрузка всех фото (сватчи + коробки) один раз при монтировании (идёт на
   // экране загрузки параллельно с моделью). Держим ссылки в ref, чтобы картинки
@@ -153,9 +153,12 @@ export const ColorPicker = memo(function ColorPicker({ presets, selectedId, onSe
     <div className="color-picker">
       {open && (
         <div className="product-card">
-          {/* ТЕСТ: вместо <img> (декод картинки на каждую смену цвета) — просто
-              цветной блок, чтобы исключить любую работу с изображениями. */}
-          <div className="product-box" style={{ background: selected.swatch ?? selected.hex }} />
+          <img
+            className="product-box"
+            src={selected.image ?? mock}
+            alt={selected.name}
+            onError={(e) => { if (e.currentTarget.src !== mock) e.currentTarget.src = mock; }}
+          />
           <div className="product-info">
             <div className="product-name">
               {selected.code ? `${selected.code} | ` : ''}{selected.name}

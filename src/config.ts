@@ -266,20 +266,7 @@ export const PRESETS: ColorPreset[] = (() => {
     if (i % 2 === 0) out[lo++] = byLuma[i]; // тёмные -> к началу/краю
     else out[hi--] = byLuma[i];             // следующие -> к концу/краю
   }
-  void out; // (реальный каталог отключён для теста — см. ниже)
-  // ===== ВРЕМЕННЫЙ ТЕСТ: простые цвета БЕЗ CDN-картинок (swatchImage/image) =====
-  // Проверяем, виноваты ли картинки в падении FPS при смене цвета. Вернуть каталог:
-  // заменить эту строку обратно на `return out;` и убрать массив ниже.
-  return [
-    { id: 't1', code: '01', name: 'Red',    subtitle: 'Test', hex: '#d12b2b' },
-    { id: 't2', code: '02', name: 'Orange', subtitle: 'Test', hex: '#e07a1f' },
-    { id: 't3', code: '03', name: 'Yellow', subtitle: 'Test', hex: '#e3c01a' },
-    { id: 't4', code: '04', name: 'Green',  subtitle: 'Test', hex: '#2f9e44' },
-    { id: 't5', code: '05', name: 'Teal',   subtitle: 'Test', hex: '#0c8599' },
-    { id: 't6', code: '06', name: 'Blue',   subtitle: 'Test', hex: '#1971c2' },
-    { id: 't7', code: '07', name: 'Violet', subtitle: 'Test', hex: '#7048e8' },
-    { id: 't8', code: '08', name: 'Pink',   subtitle: 'Test', hex: '#e64980' },
-  ];
+  return out; // тёмные по краям, светлые в центре
 })();
 
 /**
