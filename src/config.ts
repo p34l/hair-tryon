@@ -22,6 +22,8 @@ export const SEG_CLASS = {
  * WASM-рантайм MediaPipe берём с CDN jsdelivr.
  */
 export const MODEL = {
+  // ONNX (tflite->onnx) для ONNX Runtime Web — заменили протекающий MediaPipe.
+  segmenterOnnx: '/models/selfie_multiclass.onnx',
   segmenter: '/models/selfie_multiclass_256x256.tflite',
   // Выделенная модель сегментации волос (2 класса: bg/hair). Её GPU-делегат
   // намного устойчивее мультикласса: на части Android мультиклас на GPU отдаёт

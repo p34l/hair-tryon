@@ -211,11 +211,11 @@ export function CameraView() {
       return;
     }
 
-    // Классический воркер (без type:'module'): MediaPipe ломается в module-
-    // воркере (importScripts недоступен). Файл воркера не содержит ESM-import,
-    // поэтому Vite отдаёт его как классический скрипт и в dev, и в build.
+    // МОДУЛЬНЫЙ воркер: сегментация теперь на ONNX Runtime Web (ESM-import ORT).
+    // (MediaPipe требовал классический воркер; мы его выбросили из-за iOS-утечки.)
     const worker = new Worker(
       new URL('../pipeline/segmentation.worker.ts', import.meta.url),
+      { type: 'module' },
     );
     workerRef.current = worker;
 
@@ -272,10 +272,7 @@ export function CameraView() {
 
     worker.postMessage({
       type: 'init',
-      modelPath: new URL(MODEL.segmenter, location.origin).href,
-      // GPU-фолбэк для Android, где мультиклас на GPU падает (см. config).
-      hairModelPath: new URL(MODEL.segmenterHair, location.origin).href,
-      wasmRoot: MODEL.wasmRoot,
+      modelPath: new URL(MODEL.segmenterOnnx, location.origin).href,
     });
 
     return () => {
