@@ -12,6 +12,7 @@ import {
   MASK_EMA_ALPHA,
   EMA_ALPHA_STILL,
   EMA_MOTION_GAIN,
+  EMA_MOTION_DEADZONE,
   EMA_REF_DT_MS,
   EMA_DT_RATIO_MAX,
 } from '../config';
@@ -59,7 +60,9 @@ export class MaskProcessor {
         active++;
       }
     }
-    const motion = active > 0 ? diffSum / (active * 255) : 0;
+    let motion = active > 0 ? diffSum / (active * 255) : 0;
+    // Мёртвая зона: гасим шумовое «движение» — иначе маска блимает/«кипит» в покое.
+    motion = motion > EMA_MOTION_DEADZONE ? motion - EMA_MOTION_DEADZONE : 0;
 
     // 2) Адаптивный alpha: покой -> STILL, движение -> к MAX.
     let a = EMA_ALPHA_STILL + motion * EMA_MOTION_GAIN;
