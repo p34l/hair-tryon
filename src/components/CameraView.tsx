@@ -251,6 +251,7 @@ export function CameraView() {
     let raf = 0;
     let frameCount = 0;
     let fpsT0 = performance.now();
+    let lastSegMs = 0; // КЕП ЧАСТОТЫ инференса ~30 Гц (см. ниже)
     const isUsable = (s: HTMLVideoElement | HTMLImageElement) => {
       const v = s as HTMLVideoElement;
       const i = s as HTMLImageElement;
@@ -286,7 +287,13 @@ export function CameraView() {
       const ts = modeRef.current === 'camera'
         ? Math.round(mediaTimeRef.current * 1000)
         : Math.round(performance.now());
-      if (seg) {
+      // КЕП инференса ~30 Гц: на iOS rVFC может тикать чаще 30 (60-Гц дисплей /
+      // дубликаты кадров), и вызов segmentForVideo КАЖДЫЙ раз заставляет Safari со
+      // временем «захлёбываться» (известный баг MediaPipe). Ограничиваем частоту —
+      // маска остаётся 30 Гц (отличная), но over-calling и ускорение утечки уходят.
+      const segNow = performance.now();
+      if (seg && segNow - lastSegMs >= 32) {
+        lastSegMs = segNow;
         seg.segment(src, ts, (tex, mw, mh) => {
           if (tex) {
             renderer.render(src, { tex, w: mw, h: mh });
@@ -296,9 +303,10 @@ export function CameraView() {
           }
         });
         backendRef.current = seg.backend;
-      } else {
+      } else if (!seg) {
         renderer.render(src); // сегментатор ещё не готов — просто видео
       }
+      // (capped-кадр: ничего не делаем — canvas держит последний рендер, дисплей ~30fps)
 
       frameCount++;
       const now = performance.now();
