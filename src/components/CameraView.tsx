@@ -28,9 +28,11 @@ const IS_IOS =
   (/iP(hone|ad|od)/.test(navigator.userAgent) ||
     (/Mac/.test(navigator.userAgent) && navigator.maxTouchPoints > 1)); // iPadOS 13+
 
-// ТЕСТ: полностью отключить сегментацию (только видео, без инференса/маски) —
-// чтобы изолировать, в ней ли упор по FPS.
-const DISABLE_SEG = true;
+// Инференс блокирует главный поток на ~70-80мс (sync вокруг segmentForVideo), и это
+// ЕДИНСТВЕННЫЙ упор по FPS (проверено: без сегментации FPS высокий и утечки нет).
+// Поэтому гоняем его РЕДКО. 12 Гц было мало (12×80мс ≈ занимает весь поток), берём
+// ~7 Гц. Рендер при этом каждый кадр из постоянной маски.
+const INFER_INTERVAL_MS = 140;
 
 // --- Графические иконки (currentColor) ---
 const IconCamera = () => (
@@ -158,6 +160,7 @@ export function CameraView() {
   const mediaTimeRef = useRef(0); // mediaTime кадра из rVFC для segmentForVideo
   const backendRef = useRef(''); // активная ступень сегментации (multi@GPU / hair@GPU / hair@CPU)
   const maskCountRef = useRef(0); // счётчик масок за текущую секунду (для Hz)
+  const lastInferRef = useRef(0); // время последнего инференса (throttle)
   const prepMsRef = useRef(0); // EMA: подготовка входа (drawImage+getImageData), мс
   const infMsRef = useRef(0);  // EMA: инференс (segmentForVideo до колбэка), мс
   const rendMsRef = useRef(0); // EMA: наш рендер внутри колбэка, мс
@@ -214,8 +217,9 @@ export function CameraView() {
     // (getAsWebGLTexture) и идёт прямо в шейдер — без getAs*Array, без воркера,
     // без пересылки между потоками. Renderer уже создал webgl2-контекст на этом
     // canvas; сегментатор его переиспользует (опция canvas).
-    // usePixels=IS_IOS: на iOS маску берём пикселями (getAsWebGLTexture там течёт).
-    const segmenter = new HairSegmenter(canvas, IS_IOS);
+    // usePixels=true: маску читаем пикселями (256²) в постоянную текстуру — её
+    // рендер сэмплит каждый кадр, инференс throttled (см. INFER_INTERVAL_MS).
+    const segmenter = new HairSegmenter(canvas, true);
     segmenterRef.current = segmenter;
     let cancelled = false;
 
@@ -310,46 +314,33 @@ export function CameraView() {
       const ts = modeRef.current === 'camera'
         ? Math.round(mediaTimeRef.current * 1000)
         : Math.round(performance.now());
-      if (seg && !DISABLE_SEG) {
+      const nowT = performance.now();
+      if (seg && nowT - lastInferRef.current >= INFER_INTERVAL_MS) {
+        lastInferRef.current = nowT;
         const tA = performance.now();
-        // Один захват кадра как VideoFrame на оба consumer'а (Android); iOS — ImageData.
-        let segSource: TexImageSource;
-        let renderSource: HTMLVideoElement | HTMLImageElement | VideoFrame = src;
-        let vf: VideoFrame | null = null;
-        if (IS_IOS) {
-          segCtx.drawImage(src, 0, 0, SEG_SIZE, SEG_SIZE);
-          segSource = segCtx.getImageData(0, 0, SEG_SIZE, SEG_SIZE);
-        } else if (typeof VideoFrame !== 'undefined' && src instanceof HTMLVideoElement) {
-          vf = new VideoFrame(src, { timestamp: ts });
-          segSource = vf;
-          renderSource = vf;
-        } else {
-          segSource = src;
-        }
+        // Вход 256²: iOS — ImageData (против утечки от GPU-источников), Android — canvas.
+        segCtx.drawImage(src, 0, 0, SEG_SIZE, SEG_SIZE);
+        const segSource: TexImageSource = IS_IOS
+          ? segCtx.getImageData(0, 0, SEG_SIZE, SEG_SIZE)
+          : segCanvas;
         const tB = performance.now();
-        let tC = tB, tD = tB;
+        let tC = tB;
         seg.segment(segSource, ts, (payload) => {
           tC = performance.now();
-          if (payload?.tex) {
-            renderer.render(renderSource, { tex: payload.tex, w: payload.width, h: payload.height });
-            maskCountRef.current++;
-          } else if (payload?.data) {
+          if (payload?.data) {
             renderer.updateMask(payload.data, payload.width, payload.height);
-            renderer.render(renderSource);
             maskCountRef.current++;
-          } else {
-            renderer.render(renderSource);
           }
-          tD = performance.now();
         });
-        vf?.close();
         prepMsRef.current = prepMsRef.current * 0.85 + (tB - tA) * 0.15;
         infMsRef.current = infMsRef.current * 0.85 + (tC - tB) * 0.15;
-        rendMsRef.current = rendMsRef.current * 0.85 + (tD - tC) * 0.15;
         backendRef.current = seg.backend;
-      } else {
-        renderer.render(src);
       }
+
+      // Рендер — каждый кадр из постоянной маски (не ждёт инференс).
+      const tR = performance.now();
+      renderer.render(src);
+      rendMsRef.current = rendMsRef.current * 0.85 + (performance.now() - tR) * 0.15;
 
       frameCount++;
       const now = performance.now();
@@ -358,7 +349,7 @@ export function CameraView() {
         setFps(Math.round(frameCount / secs));
         // Диагностика: бекенд · время инференса · частота масок (Гц).
         const maskHz = Math.round(maskCountRef.current / secs);
-        setDbg(`[v15·NOSEG] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
+        setDbg(`[v16·7Hz] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
         maskCountRef.current = 0;
         frameCount = 0;
         fpsT0 = now;
