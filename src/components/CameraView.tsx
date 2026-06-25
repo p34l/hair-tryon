@@ -258,17 +258,17 @@ export function CameraView() {
       return i.complete && i.naturalWidth > 0;
     };
 
-    // Вход сегментатора — УМЕНЬШЕННЫЙ ПЕРЕИСПОЛЬЗУЕМЫЙ кадр 256², а НЕ живой <video>:
-    //  (1) per-frame upload в MediaPipe крошечный → Android не упирается в GPU;
-    //  (2) на iOS повторный upload БОЛЬШОГО видео в MediaPipe течёт GPU-памятью —
-    //      за ~минуту FPS падает и не встаёт; уменьшенный reused-canvas это лечит.
-    // Геометрия как в рабочей версии: stretch в квадрат; шейдер сэмплит маску по
-    // sampleUv (тот же [0,1] над кадром), поэтому маска совпадает с видео.
+    // Вход сегментатора — УМЕНЬШЕННЫЕ CPU-ПИКСЕЛИ (ImageData) 256², а НЕ живой
+    // <video> и НЕ GPU-backed canvas. КРИТИЧНО для iOS: повторный upload в
+    // MediaPipe видео/нарисованного через drawImage канваса течёт GPU-памятью —
+    // FPS обваливается (30->8 за пару секунд). Подача ImageData (как putImageData
+    // в старой воркерной версии) аллокаций не плодит. 256² ещё и разгружает Android.
+    // Геометрия: stretch в квадрат; шейдер сэмплит маску по sampleUv (тот же [0,1]).
     const SEG_SIZE = 256;
-    const segInput = document.createElement('canvas');
-    segInput.width = SEG_SIZE;
-    segInput.height = SEG_SIZE;
-    const segCtx = segInput.getContext('2d')!;
+    const segCanvas = document.createElement('canvas');
+    segCanvas.width = SEG_SIZE;
+    segCanvas.height = SEG_SIZE;
+    const segCtx = segCanvas.getContext('2d', { willReadFrequently: true })!;
 
     const onFrame = () => {
       const src: HTMLVideoElement | HTMLImageElement =
@@ -299,9 +299,11 @@ export function CameraView() {
         ? Math.round(mediaTimeRef.current * 1000)
         : Math.round(performance.now());
       if (seg) {
-        // Уменьшаем кадр в reused 256²-канвас и его отдаём сегментатору (не live video).
+        // Уменьшаем кадр и отдаём сегментатору CPU-пикселями (ImageData), не GPU-
+        // backed канвасом/видео — иначе MediaPipe на iOS течёт памятью (см. выше).
         segCtx.drawImage(src, 0, 0, SEG_SIZE, SEG_SIZE);
-        seg.segment(segInput, ts, (tex, mw, mh) => {
+        const segPixels = segCtx.getImageData(0, 0, SEG_SIZE, SEG_SIZE);
+        seg.segment(segPixels, ts, (tex, mw, mh) => {
           if (tex) {
             renderer.render(src, { tex, w: mw, h: mh });
             maskCountRef.current++;
