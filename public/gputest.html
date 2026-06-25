@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Zero-readback GPU prototype</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #fff;
+    font: 13px/1.4 -apple-system, system-ui, sans-serif; overflow: hidden; }
+  #out { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  #hud { position: fixed; left: 8px; bottom: 8px; z-index: 10; white-space: pre;
+    background: rgba(0,0,0,.55); padding: 8px 10px; border-radius: 8px;
+    font-variant-numeric: tabular-nums; }
+  #start { position: fixed; inset: 0; display: flex; align-items: center;
+    justify-content: center; z-index: 20; background: #111; }
+  #start button { font-size: 18px; padding: 14px 22px; border-radius: 12px;
+    border: 0; background: #6cc24a; color: #093; font-weight: 700; }
+</style>
+</head>
+<body>
+  <canvas id="out"></canvas>
+  <div id="hud">starting…</div>
+  <div id="start"><button id="go">Tap to start camera</button></div>
+
+<script type="module">
+// Самодостатня перевірка нуль-readback ланцюга:
+//   камера -> MediaStreamTrackProcessor(VideoFrame) -> ImageSegmenter(GPU, наш canvas)
+//   -> mask.getAsWebGLTexture() (маска лишається на GPU) -> наш recolor-шейдер
+//   у ТОМУ Ж GL-контексті -> вивід на екран. Жодного getAs*Array (нуль GPU->CPU).
+import { ImageSegmenter, FilesetResolver }
+  from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35';
+
+const hud = document.getElementById('hud');
+const canvas = document.getElementById('out');
+const HAIR = 1;                       // індекс класу «волосся» (hair_segmenter: 0 bg,1 hair)
+const MODEL = '/models/hair_segmenter.tflite';
+const WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
+
+function fail(msg) { hud.textContent = 'ERROR\n' + msg; console.error(msg); }
+
+document.getElementById('go').addEventListener('click', async () => {
+  document.getElementById('start').remove();
+  try { await run(); } catch (e) { fail(String(e && e.stack || e)); }
+});
+
+async function run() {
+  // 1) Перевірка фіч (це Chromium/Android; на iOS Safari MSTP немає).
+  if (typeof MediaStreamTrackProcessor === 'undefined')
+    return fail('No MediaStreamTrackProcessor (need Chromium/Android).');
+
+  // 2) Камера.
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 },
+             frameRate: { min: 24, ideal: 30 } },
+  });
+  const track = stream.getVideoTracks()[0];
+  const settings = track.getSettings();
+  const VW = settings.width || 1280, VH = settings.height || 720;
+
+  // 3) GL-контекст СТВОРЮЄ MediaPipe на нашому canvas (опція canvas).
+  //    Розмір canvas = розмір відео; виводимо cover'ом через CSS.
+  canvas.width = VW; canvas.height = VH;
+  const fileset = await FilesetResolver.forVisionTasks(WASM);
+  let delegate = 'GPU';
+  let segmenter;
+  try {
+    segmenter = await ImageSegmenter.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: MODEL, delegate: 'GPU' },
+      canvas, runningMode: 'VIDEO',
+      outputCategoryMask: false, outputConfidenceMasks: true,
+    });
+  } catch (e) {
+    delegate = 'CPU';
+    segmenter = await ImageSegmenter.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: MODEL, delegate: 'CPU' },
+      canvas, runningMode: 'VIDEO',
+      outputCategoryMask: false, outputConfidenceMasks: true,
+    });
+  }
+
+  // 4) Беремо ТОЙ САМИЙ GL-контекст, що ним користується MediaPipe.
+  const gl = canvas.getContext('webgl2');
+  if (!gl) return fail('No webgl2 context on shared canvas.');
+  const prog = buildProgram(gl);
+  const videoTex = gl.createTexture();
+
+  // 5) Кадри камери як VideoFrame (zero-copy на Chrome).
+  const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+
+  let ts = 0, frames = 0, t0 = performance.now();
+  let infMs = 0, rdMs = 0, gpuMask = 0, maskHz = 0, maskCount = 0;
+
+  while (true) {
+    const { value: frame, done } = await reader.read();
+    if (done) break;
+
+    const tA = performance.now();
+    // Інференс + у колбеку — нуль-readback візуалізація.
+    segmenter.segmentForVideo(frame, ++ts, (res) => {
+      const tB = performance.now();
+      const mask = res.confidenceMasks && res.confidenceMasks[HAIR];
+      if (mask) {
+        gpuMask = mask.hasWebGLTexture() ? 1 : 0;   // 1 = маска вже на GPU (без readback)
+        const maskTex = mask.getAsWebGLTexture();     // лишається на GPU
+        draw(gl, prog, videoTex, frame, maskTex);
+        maskCount++;
+      }
+      const tC = performance.now();
+      infMs = infMs * 0.85 + (tB - tA) * 0.15;       // інференс
+      rdMs  = rdMs  * 0.85 + (tC - tB) * 0.15;       // getAsWebGLTexture + наш draw
+      res.close && res.close();
+    });
+    frame.close();
+
+    frames++;
+    const now = performance.now();
+    if (now - t0 >= 500) {
+      const secs = (now - t0) / 1000;
+      const fps = Math.round(frames / secs);
+      maskHz = Math.round(maskCount / secs);
+      hud.textContent =
+        `FPS ${fps}   mask ${maskHz}Hz\n` +
+        `delegate ${delegate}   gpuMask ${gpuMask ? 'YES (0 readback)' : 'no'}\n` +
+        `inf ${infMs.toFixed(1)}ms   tex+draw ${rdMs.toFixed(1)}ms\n` +
+        `${VW}x${VH}`;
+      frames = 0; maskCount = 0; t0 = now;
+    }
+  }
+}
+
+// --- Мінімальний recolor: відео + маска(r=впевненість) -> тонуємо волосся ---
+function buildProgram(gl) {
+  const vs = `#version 300 es
+  out vec2 v;
+  void main(){ vec2 p=vec2((gl_VertexID==2)?3.:-1.,(gl_VertexID==1)?3.:-1.);
+    v=vec2((p.x+1.)*.5,1.-(p.y+1.)*.5); gl_Position=vec4(p,0.,1.); }`;
+  const fs = `#version 300 es
+  precision highp float;
+  in vec2 v; out vec4 o;
+  uniform sampler2D uVid; uniform sampler2D uMask;
+  void main(){
+    vec3 c = texture(uVid, v).rgb;
+    float m = texture(uMask, v).r;          // 0..1 впевненість «волосся»
+    vec3 tint = vec3(0.85, 0.12, 0.35);     // помітний колір — щоб одразу бачити маску
+    o = vec4(mix(c, tint, clamp(m,0.,1.)*0.7), 1.0);
+  }`;
+  const c = (t, s) => { const sh = gl.createShader(t); gl.shaderSource(sh, s);
+    gl.compileShader(sh); if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+      throw new Error(gl.getShaderInfoLog(sh)); return sh; };
+  const p = gl.createProgram();
+  gl.attachShader(p, c(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, c(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+function draw(gl, prog, videoTex, frame, maskTex) {
+  // Заливаємо кадр камери у власну текстуру (VideoFrame — валідний TexImageSource).
+  gl.bindTexture(gl.TEXTURE_2D, videoTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); // на екран (canvas)
+  gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+  gl.useProgram(prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, videoTex);
+  gl.uniform1i(gl.getUniformLocation(prog, 'uVid'), 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, maskTex);
+  // Маска MediaPipe може бути R32F: для надійної фільтрації ставимо NEAREST.
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.uniform1i(gl.getUniformLocation(prog, 'uMask'), 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+</script>
+</body>
+</html>
