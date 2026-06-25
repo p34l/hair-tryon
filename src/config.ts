@@ -22,9 +22,10 @@ export const SEG_CLASS = {
  * WASM-рантайм MediaPipe берём с CDN jsdelivr.
  */
 export const MODEL = {
-  // BiSeNet face-parsing (ONNX) для ONNX Runtime Web — pure CNN, WebGPU-friendly,
-  // без attention-транспозов (в отличие от selfie_multiclass) и без MediaPipe-утечки.
-  segmenterOnnx: '/models/bisenet_hair.onnx',
+  // SelfieMulticlass (модель MediaPipe!) tflite->onnx, NCHW, softmax+hair в графе.
+  // Та же модель, что давала лучшую маску в MediaPipe-пайплайне, но через ORT — без
+  // утечки. Запускаем на WebGPU (~120мс, в воркере FPS не дропает).
+  segmenterOnnx: '/models/selfie_hair.onnx',
   segmenter: '/models/selfie_multiclass_256x256.tflite',
   // Выделенная модель сегментации волос (2 класса: bg/hair). Её GPU-делегат
   // намного устойчивее мультикласса: на части Android мультиклас на GPU отдаёт

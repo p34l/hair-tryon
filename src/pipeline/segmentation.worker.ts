@@ -1,23 +1,18 @@
 /**
- * Web Worker: сегментация волос через ONNX Runtime Web на ЧИСТО-СВЁРТОЧНОЙ BiSeNet
- * (face-parsing.PyTorch), сконвертированной в ONNX.
+ * Web Worker: сегментация волос через ONNX Runtime Web на модели MediaPipe
+ * SelfieMulticlass (tflite -> onnx, конвертирована в NCHW + патч resize + softmax/
+ * выбор класса hair в графе). Это ТА ЖЕ модель, что давала лучшую маску в MediaPipe-
+ * пайплайне — но БЕЗ протекающего MediaPipe-рантайма (ORT не течёт на iOS).
  *
- * Почему именно эта модель: предыдущая (selfie_multiclass из tflite) — гибрид
- * CNN+attention с десятками Transpose (NHWC), которые WebGPU-EP тянет плохо/неверно
- * → инференс ~120мс и кривая маска. BiSeNet — pure CNN (НОЛЬ Transpose, NCHW),
- * WebGPU гоняет её правильно и быстро. И никакого MediaPipe → нет iOS-утечки.
- *
- * Модель: вход [1,3,512,512] NCHW, ImageNet-нормализация; в граф добавлен softmax
- * по каналам + выбор класса hair(17) -> выход [1,1,512,512] вероятность волос.
- * Маску ужимаем до 256² (под настройку recolor-шейдера) и отдаём как Uint8.
+ * Модель: вход [1,3,256,256] NCHW, нормализация [0,1]; в граф добавлен softmax по
+ * каналам + выбор класса hair(1) -> выход [1,256,256,1] вероятность волос (256²,
+ * сразу под recolor-шейдер). У неё есть attention-транспозы → WebGPU ~120мс (но в
+ * воркере это не дропает FPS), зато качество маски как в пайплайне.
  */
 
 import * as ort from 'onnxruntime-web';
 
-const IN = 512;   // вход модели
-const OUT = 256;  // размер маски, который ждёт пайплайн (recolor тюнен под 256)
-const MEAN = [0.485, 0.456, 0.406];
-const STD = [0.229, 0.224, 0.225];
+const SIZE = 256;
 
 ort.env.wasm.wasmPaths = '/ort/';
 ort.env.wasm.numThreads = 1;
@@ -29,19 +24,13 @@ console.warn = (...a: any[]) => { ortLogs.push('W ' + a.map(String).join(' ').sl
 console.error = (...a: any[]) => { ortLogs.push('E ' + a.map(String).join(' ').slice(0, 140)); _err(...a); };
 
 let session: ort.InferenceSession | null = null;
-let inputName = 'input';
+let inputName = 'input_29';
 let outputName = 'hair';
 let backend = 'onnx';
 let busy = false;
 
-// Канвасы для ресайза входного кадра до 512² (putImageData не масштабирует).
-const srcCanvas = new OffscreenCanvas(OUT, OUT);
-const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true })!;
-const inCanvas = new OffscreenCanvas(IN, IN);
-const inCtx = inCanvas.getContext('2d', { willReadFrequently: true })!;
-
-const inputBuf = new Float32Array(3 * IN * IN);
-let maskBuf = new Uint8Array(OUT * OUT);
+const inputBuf = new Float32Array(3 * SIZE * SIZE);
+const maskBuf = new Uint8Array(SIZE * SIZE);
 
 function post(msg: any, transfer?: Transferable[]) {
   (self as any).postMessage(msg, transfer ?? []);
@@ -54,7 +43,7 @@ async function init(modelUrl: string) {
       executionProviders: ['webgpu'], graphOptimizationLevel: 'all',
     });
     inputName = s.inputNames[0]; outputName = s.outputNames[0];
-    const warm = new ort.Tensor('float32', new Float32Array(3 * IN * IN), [1, 3, IN, IN]);
+    const warm = new ort.Tensor('float32', new Float32Array(3 * SIZE * SIZE), [1, 3, SIZE, SIZE]);
     const o = await s.run({ [inputName]: warm });
     const ot = o[outputName] as any;
     const d: Float32Array = ot.location && ot.location !== 'cpu' ? await ot.getData(true) : ot.data;
@@ -83,40 +72,27 @@ async function segment(pixels: ArrayBuffer, w: number, h: number) {
   busy = true;
   const t0 = performance.now();
   try {
-    // Входные пиксели (обычно 256² RGBA) -> апскейл до 512² через 2 канваса.
-    const src = new ImageData(new Uint8ClampedArray(pixels), w, h);
-    if (srcCanvas.width !== w || srcCanvas.height !== h) { srcCanvas.width = w; srcCanvas.height = h; }
-    srcCtx.putImageData(src, 0, 0);
-    inCtx.drawImage(srcCanvas, 0, 0, IN, IN);
-    const id = inCtx.getImageData(0, 0, IN, IN).data; // RGBA 512²
-
-    // NCHW + ImageNet-нормализация.
-    const HW = IN * IN;
+    // RGBA 256² -> NCHW float [0,1] (3 плоскости R,G,B).
+    const px = new Uint8ClampedArray(pixels);
+    const HW = w * h;
     for (let i = 0, p = 0; i < HW; i++, p += 4) {
-      inputBuf[i] = (id[p] / 255 - MEAN[0]) / STD[0];
-      inputBuf[HW + i] = (id[p + 1] / 255 - MEAN[1]) / STD[1];
-      inputBuf[2 * HW + i] = (id[p + 2] / 255 - MEAN[2]) / STD[2];
+      inputBuf[i] = px[p] / 255;
+      inputBuf[HW + i] = px[p + 1] / 255;
+      inputBuf[2 * HW + i] = px[p + 2] / 255;
     }
-    const tensor = new ort.Tensor('float32', inputBuf, [1, 3, IN, IN]);
+    const tensor = new ort.Tensor('float32', inputBuf, [1, 3, h, w]);
     const out = await session.run({ [inputName]: tensor });
     const ot = out[outputName] as any;
     const hair: Float32Array = ot.location && ot.location !== 'cpu'
-      ? await ot.getData(true) : ot.data; // [1,1,512,512] вероятность волос
+      ? await ot.getData(true) : ot.data; // [1,256,256,1] вероятность волос
 
-    // Ужимаем 512² -> 256² усреднением 2x2, в Uint8.
-    const ratio = IN / OUT; // 2
-    for (let y = 0; y < OUT; y++) {
-      for (let x = 0; x < OUT; x++) {
-        const sy = y * ratio, sx = x * ratio;
-        const a = hair[sy * IN + sx], b = hair[sy * IN + sx + 1];
-        const c = hair[(sy + 1) * IN + sx], dd = hair[(sy + 1) * IN + sx + 1];
-        const v = (a + b + c + dd) * 0.25 * 255;
-        maskBuf[y * OUT + x] = v < 0 ? 0 : v > 255 ? 255 : v;
-      }
+    for (let i = 0; i < HW; i++) {
+      const v = hair[i] * 255;
+      maskBuf[i] = v < 0 ? 0 : v > 255 ? 255 : v;
     }
     const data = maskBuf.slice();
     post(
-      { type: 'mask', data, width: OUT, height: OUT, infMs: performance.now() - t0, backend },
+      { type: 'mask', data, width: w, height: h, infMs: performance.now() - t0, backend },
       [data.buffer],
     );
   } catch (err) {
