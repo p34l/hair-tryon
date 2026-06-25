@@ -21,12 +21,14 @@ const SIZE = 256;
 const HAIR = 1;        // SelfieMulticlass: 0 bg,1 hair,2 body,3 face,4 clothes,5 other
 const CLASSES = 6;
 
-// WASM-бинарь ORT с CDN (версия = установленной в package.json).
-ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
-// Многопоточность требует cross-origin isolation (SharedArrayBuffer). Без COOP/COEP
-// — один поток; SIMD работает и так и даёт основной выигрыш.
+// WASM-бинарь ORT берём со СВОЕГО origin (/ort/): под COEP кросс-доменный CDN
+// был бы заблокирован. Файлы лежат в public/ort (скопированы из node_modules).
+ort.env.wasm.wasmPaths = '/ort/';
+// Многопоточность требует cross-origin isolation (SharedArrayBuffer): включается
+// COOP/COEP-заголовками (см. Caddyfile). Тогда инференс ~2.3× быстрее (95->41мс).
+// Где изоляции нет (старый iOS) — один поток (медленнее, но работает).
 ort.env.wasm.numThreads = (self as any).crossOriginIsolated
-  ? Math.min(4, (navigator as any).hardwareConcurrency || 2)
+  ? Math.min(4, (navigator as any).hardwareConcurrency || 4)
   : 1;
 
 let session: ort.InferenceSession | null = null;
@@ -49,7 +51,8 @@ async function init(modelUrl: string) {
       executionProviders: ['wasm'],
       graphOptimizationLevel: 'all',
     });
-    backend = 'onnx@wasm';
+    // В метку — число потоков, чтобы по HUD видеть, включилась ли многопоточность.
+    backend = `onnx@wasm·${ort.env.wasm.numThreads}t`;
     inputName = session.inputNames[0] ?? inputName;
     outputName = session.outputNames[0] ?? outputName;
     // Прогрев: первый run компилирует кернелы/аллоцирует — на пустом кадре.

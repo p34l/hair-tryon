@@ -2,9 +2,20 @@
 	root * /srv
 	encode gzip
 
+	# Cross-origin isolation: включает SharedArrayBuffer -> многопоточный WASM в ORT
+	# (инференс ~2.3× быстрее). COEP=credentialless (а не require-corp), чтобы кросс-
+	# доменные картинки сватчей (sk-qr.com) грузились без CORP на Chrome/Android и
+	# iOS 17.4+. Где credentialless не поддержан — изоляции нет, ORT в один поток.
+	header Cross-Origin-Opener-Policy "same-origin"
+	header Cross-Origin-Embedder-Policy "credentialless"
+
 	# Хэшированные ассеты (имя содержит хэш) можно кэшировать надолго.
 	@assets path /assets/*
 	header @assets Cache-Control "public, max-age=31536000, immutable"
+
+	# ORT-рантайм (большие .wasm) и модели — тоже кэшируем надолго.
+	@runtime path /ort/* /models/*
+	header @runtime Cache-Control "public, max-age=31536000"
 
 	# HTML не кэшируем — иначе Safari держит старый index.html и новый деплой
 	# (с новым хэшем JS) не подхватывается.
