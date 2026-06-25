@@ -343,8 +343,22 @@ export class Renderer {
     return out;
   }
 
-  /** Рисует один кадр. Источник — video или image (для debug-загрузки фото). */
-  render(source: HTMLVideoElement | HTMLImageElement) {
+  /**
+   * Рисует один кадр. Источник — video или image (для debug-загрузки фото).
+   *
+   * ext — ВНЕШНЯЯ текстура маски (из MPMask.getAsWebGLTexture), которая живёт на
+   * GPU в ЭТОМ ЖЕ контексте (zero-readback). Если передана — сэмплируем её как
+   * u_mask напрямую, без CPU-upload. Валидна только в колбэке segmentForVideo,
+   * поэтому render(ext) вызывается оттуда же. Без ext — используем свою maskTex.
+   *
+   * ВАЖНО: сегментатор делит этот GL-контекст и оставляет своё состояние (program,
+   * FBO, привязки текстур, viewport). Поэтому в начале кадра ПОЛНОСТЬЮ
+   * восстанавливаем наш стейт — иначе рисуется чёрное/мусор.
+   */
+  render(
+    source: HTMLVideoElement | HTMLImageElement,
+    ext?: { tex: WebGLTexture; w: number; h: number },
+  ) {
     if (this.contextLost) return;
     const gl = this.gl;
     const v = source as HTMLVideoElement;
@@ -352,6 +366,20 @@ export class Renderer {
     const w = v.videoWidth || i.naturalWidth || 0;
     const h = v.videoHeight || i.naturalHeight || 0;
     if (!w || !h) return;
+
+    // --- Восстановление нашего GL-стейта после MediaPipe (общий контекст) ---
+    gl.useProgram(this.program);
+    gl.bindVertexArray(this.vao);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null); // рисуем на экран, а не в чужой FBO
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.CULL_FACE);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+    gl.uniform1i(this.uVideo, 0);
+    gl.uniform1i(this.uMask, 1);
+    gl.uniform1i(this.uLut, 2);
 
     // Рендер-таргет = ВИДИМАЯ область сцены × DPR (а не разрешение видео): не
     // считаем per-pixel за пределами кропа. Аспект буфера = аспекту CSS-бокса,
@@ -385,10 +413,11 @@ export class Renderer {
     if (srcAspect > outAspect) coverX = outAspect / srcAspect;
     else coverY = srcAspect / outAspect;
 
-    // Видео-текстура на юните 0 (он активен). Storage один раз, далее texSubImage2D.
+    // Видео-текстура на юните 0. Storage один раз, далее texSubImage2D.
     // ВАЖНО: обычный RGBA8 (НЕ SRGB8_ALPHA8). На iOS Safari покадровый upload в
     // sRGB-текстуру подтекает GPU-памятью → за ~20с упирается в лимит вкладки и
     // FPS падает без отката. sRGB->linear делаем в шейдере (srgb2lin) — цвет тот же.
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
     if (w !== this.videoTexW || h !== this.videoTexH) {
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
@@ -398,7 +427,36 @@ export class Renderer {
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, source);
     }
 
-    // Только меняющиеся uniform-ы (статика и сэмплеры выставлены в initGLResources).
+    // --- Маска на юните 1 ---
+    gl.activeTexture(gl.TEXTURE1);
+    if (ext) {
+      // Внешняя GPU-текстура маски (zero-readback). Размер маски = размер входа
+      // сегментатора (обычно разрешение видео). u_maskTexel/feather масштабируем,
+      // чтобы окрестность joint-bilateral по UV совпала с настройкой под сетку 256.
+      gl.bindTexture(gl.TEXTURE_2D, ext.tex);
+      // MediaPipe-текстура маски может быть float и не фильтроваться LINEAR на
+      // мобильных — ставим NEAREST/CLAMP, безопасно для сэмплинга со смещениями.
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const mw = ext.w || INFERENCE_SIZE;
+      const mh = ext.h || INFERENCE_SIZE;
+      gl.uniform2f(this.uMaskTexel, 1 / mw, 1 / mh);
+      gl.uniform1f(this.uFeather, FEATHER_RADIUS * Math.max(1, mw / INFERENCE_SIZE));
+      this.maskReady = true;
+    } else {
+      // Легаси-путь (фото-режим/фолбэк): наша загруженная R8-маска 256².
+      gl.bindTexture(gl.TEXTURE_2D, this.maskTex);
+      gl.uniform2f(this.uMaskTexel, 1 / INFERENCE_SIZE, 1 / INFERENCE_SIZE);
+      gl.uniform1f(this.uFeather, FEATHER_RADIUS);
+    }
+
+    // LUT на юните 2 (перепривязываем — MediaPipe мог сбить привязку).
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
+
+    // Только меняющиеся uniform-ы.
     gl.uniform1f(this.uLutRow, this.lutReady ? this.lutRow : -1.0);
     gl.uniform3f(this.uTargetLab, this.targetLab[0], this.targetLab[1], this.targetLab[2]);
     gl.uniform1f(this.uStrength, this.maskReady ? this.strength : 0.0);

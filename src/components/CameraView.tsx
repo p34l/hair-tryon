@@ -7,16 +7,16 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Renderer } from '../render/renderer';
-import { MaskProcessor } from '../pipeline/maskProcessing';
+import { HairSegmenter } from '../pipeline/segmenter';
 import { startCamera } from '../pipeline/camera';
 import { ColorPicker } from './ColorPicker';
 import { IntensityToggle } from './IntensityToggle';
 import { LegalOverlay } from './LegalOverlay';
 import {
-  PRESETS, INFERENCE_SIZE, INTENSITY_PARAMS, MODEL, LOGO,
-  hexToRgb, CAPTURE_COUNTDOWN, FACE_DETECT_INTERVAL_MS, ENABLE_BEARD_EXCLUSION,
+  PRESETS, INTENSITY_PARAMS, MODEL, LOGO,
+  hexToRgb, CAPTURE_COUNTDOWN,
 } from '../config';
-import type { Intensity, ColorPreset, WorkerResponse } from '../types';
+import type { Intensity, ColorPreset } from '../types';
 
 type Status = 'loading' | 'ready' | 'denied' | 'error';
 
@@ -134,34 +134,17 @@ export function CameraView() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const rendererRef = useRef<Renderer | null>(null);
-  const workerRef = useRef<Worker | null>(null);
-  const processorRef = useRef(new MaskProcessor());
-  // FaceLandmarker теперь в ОТДЕЛЬНОМ воркере (инференс ушёл с главного потока).
-  const faceWorkerRef = useRef<Worker | null>(null);
-  const faceInFlightRef = useRef(false);
-  const faceWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const exclusionRef = useRef<Uint8Array | null>(null);
+  const segmenterRef = useRef<HairSegmenter | null>(null);
   const cameraHandleRef = useRef<{ stop: () => void } | null>(null);
   const guideSeenRef = useRef(false); // гайд «HOW TO SAVE» показываем 1 раз за сессию
-  // Замок «кадр в обработке у воркера» + watchdog, чтобы пайплайн не залип,
-  // если воркер уронил кадр (без хака (worker as any).__inFlight).
-  const inFlightRef = useRef(false);
-  const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Текущий blob-URL фото (для revoke) и токен запроса (анти-гонка onload).
   const blobUrlRef = useRef<string | null>(null);
   const photoReqRef = useRef(0);
   // Таймер обратного отсчёта снимка (чистим в общем cleanup).
   const captureTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const captureBusyRef = useRef(false);
-  // Pipeline маски (как после Wave 3): latest-wins coalescing + mediaTime.
-  const latestSourceRef = useRef<HTMLVideoElement | HTMLImageElement | null>(null);
-  const frameDirtyRef = useRef(false);
-  const sendSegRef = useRef<((s: HTMLVideoElement | HTMLImageElement) => void) | null>(null);
   const mediaTimeRef = useRef(0); // mediaTime кадра из rVFC для segmentForVideo
-  const lastMaskAtRef = useRef(0); // время прихода прошлой маски (dt для EMA-компенсации)
   const backendRef = useRef(''); // активная ступень сегментации (multi@GPU / hair@GPU / hair@CPU)
-  const infMsRef = useRef(0); // сглаженное время инференса сегментации, мс
-  const readMsRef = useRef(0); // сглаженное время readback+обработки маски, мс
   const maskCountRef = useRef(0); // счётчик масок за текущую секунду (для Hz)
 
   const [status, setStatus] = useState<Status>('loading');
@@ -211,128 +194,44 @@ export function CameraView() {
       return;
     }
 
-    // Классический воркер (без type:'module'): MediaPipe ломается в module-
-    // воркере (importScripts недоступен). Файл воркера не содержит ESM-import,
-    // поэтому Vite отдаёт его как классический скрипт и в dev, и в build.
-    const worker = new Worker(
-      new URL('../pipeline/segmentation.worker.ts', import.meta.url),
-    );
-    workerRef.current = worker;
+    // Сегментатор НА ГЛАВНОМ ПОТОКЕ в ОБЩЕМ с рендером GL-контексте (тот же
+    // canvas). Это включает zero-readback: маска остаётся текстурой на GPU
+    // (getAsWebGLTexture) и идёт прямо в шейдер — без getAs*Array, без воркера,
+    // без пересылки между потоками. Renderer уже создал webgl2-контекст на этом
+    // canvas; сегментатор его переиспользует (опция canvas).
+    const segmenter = new HairSegmenter(canvas);
+    segmenterRef.current = segmenter;
+    let cancelled = false;
 
-    const clearInFlight = () => {
-      inFlightRef.current = false;
-      if (watchdogRef.current) {
-        clearTimeout(watchdogRef.current);
-        watchdogRef.current = null;
-      }
-    };
-
-    worker.onerror = (e) => {
-      clearInFlight(); // не залипаем после ошибки воркера
-      setStatus('error');
-      setErrorMsg('Worker: ' + (e.message || 'load/runtime error'));
-    };
-    worker.onmessage = (e: MessageEvent<WorkerResponse>) => {
-      const msg = e.data;
-      if (msg.type === 'ready') {
-        setModelReady(true); // модель сегментации загружена -> можно просить камеру
-        if ((msg as any).backend) backendRef.current = (msg as any).backend;
-      } else if (msg.type === 'error') {
-        clearInFlight();
+    segmenter
+      .init(
+        new URL(MODEL.segmenter, location.origin).href,
+        // GPU-фолбэк для Android, где мультиклас на GPU падает (см. config).
+        new URL(MODEL.segmenterHair, location.origin).href,
+      )
+      .then(() => {
+        if (cancelled) return;
+        segmenter.warmup(); // компилируем GPU-кернелы до старта камеры
+        backendRef.current = segmenter.backend;
+        setModelReady(true);
+      })
+      .catch((e) => {
+        if (cancelled) return;
         setStatus('error');
-        setErrorMsg(msg.message ?? 'Ошибка воркера');
-      } else if (msg.type === 'mask') {
-        clearInFlight();
-        // Фактический интервал между готовыми масками — для framerate-компенсации
-        // EMA (на Android-CPU маски реже, и без этого EMA добавляет лишний лаг).
-        const nowMask = performance.now();
-        const dtMs = lastMaskAtRef.current > 0 ? nowMask - lastMaskAtRef.current : 0;
-        lastMaskAtRef.current = nowMask;
-        // Диагностика: бекенд, время инференса (EMA) и счётчик масок за секунду.
-        if ((msg as any).backend) backendRef.current = (msg as any).backend;
-        const inf = (msg as any).infMs;
-        if (typeof inf === 'number') infMsRef.current = infMsRef.current * 0.8 + inf * 0.2;
-        const rd = (msg as any).readMs;
-        if (typeof rd === 'number') readMsRef.current = readMsRef.current * 0.8 + rd * 0.2;
-        maskCountRef.current++;
-        const processed = processorRef.current.process(msg.data, {
-          smooth: true, // EMA-сглаживание (этап 2)
-          dtMs, // framerate-компенсация постоянной времени EMA
-          // вычитаем зону бороды/нижней части лица (этап 1) — всегда включено
-          exclusion: exclusionRef.current,
-        });
-        rendererRef.current?.updateMask(processed, msg.width, msg.height);
-        // Latest-wins: воркер свободен — сразу шлём свежий кадр (как в Wave 3),
-        // чтобы маска была максимально актуальной (лучше держится на голове).
-        if (frameDirtyRef.current && latestSourceRef.current) {
-          sendSegRef.current?.(latestSourceRef.current);
-        }
-      }
-    };
-
-    worker.postMessage({
-      type: 'init',
-      modelPath: new URL(MODEL.segmenter, location.origin).href,
-      // GPU-фолбэк для Android, где мультиклас на GPU падает (см. config).
-      hairModelPath: new URL(MODEL.segmenterHair, location.origin).href,
-      wasmRoot: MODEL.wasmRoot,
-    });
+        setErrorMsg(String(e));
+      });
 
     return () => {
-      worker.terminate();
-      workerRef.current = null;
-      clearInFlight();
+      cancelled = true;
+      segmenter.close();
+      segmenterRef.current = null;
       rendererRef.current?.dispose();
       rendererRef.current = null;
     };
   }, []);
 
-  // --- Инициализация FaceLandmarker во ВТОРОМ воркере (вне главного потока) ---
-  // Раньше detectForVideo крутился на main (через setTimeout на iOS, где нет
-  // requestIdleCallback) и блокировал рендер — главная причина просадки FPS на
-  // iPhone. Теперь инференс и растеризация маски целиком в воркере.
-  useEffect(() => {
-    // Второй граф (борода) по умолчанию ВЫКЛ на слабком GPU — освобождаем GPU
-    // под рендер сегментатора (см. ENABLE_BEARD_EXCLUSION в config).
-    if (!ENABLE_BEARD_EXCLUSION) return;
-    const worker = new Worker(
-      new URL('../pipeline/faceLandmarks.worker.ts', import.meta.url),
-    );
-    faceWorkerRef.current = worker;
-
-    const clearFaceInFlight = () => {
-      faceInFlightRef.current = false;
-      if (faceWatchdogRef.current) {
-        clearTimeout(faceWatchdogRef.current);
-        faceWatchdogRef.current = null;
-      }
-    };
-
-    worker.onmessage = (e: MessageEvent) => {
-      const msg = e.data;
-      if (msg.type === 'face-mask') {
-        clearFaceInFlight();
-        // msg.data — перенесённый Uint8Array (или null, если лицо не найдено).
-        exclusionRef.current = msg.data ?? null;
-      } else if (msg.type === 'face-error') {
-        clearFaceInFlight();
-        exclusionRef.current = null;
-      }
-      // 'face-ready' — отдельных действий не требует.
-    };
-    worker.onerror = () => { clearFaceInFlight(); };
-
-    worker.postMessage({
-      type: 'init',
-      modelPath: new URL(MODEL.faceLandmarker, location.origin).href,
-    });
-
-    return () => {
-      worker.terminate();
-      faceWorkerRef.current = null;
-      clearFaceInFlight();
-    };
-  }, []);
+  // Exclusion-маска бороды (FaceLandmarker) убрана из real-time пути: второй
+  // тяжёлый граф делил GPU и ронял FPS. Zero-readback пайплайн её не использует.
 
   // --- Минимальное время показа экрана загрузки (чтобы анимация не мигала) ---
   useEffect(() => {
@@ -352,51 +251,12 @@ export function CameraView() {
     let raf = 0;
     let frameCount = 0;
     let fpsT0 = performance.now();
-    let lastFaceSend = 0; // троттлинг отправки кадров в face-воркер (~4 Гц)
-
-    // Reused-canvas для подготовки кадра 256 воркерам. Вместо createImageBitmap
-    // (течёт по памяти на iOS) — drawImage+getImageData и transfer буфера пикселей.
-    const frameCanvas = document.createElement('canvas');
-    frameCanvas.width = INFERENCE_SIZE;
-    frameCanvas.height = INFERENCE_SIZE;
-    const frameCtx = frameCanvas.getContext('2d', { willReadFrequently: true })!;
-    // Геометрия как раньше: source растягивается в квадрат 256 (stretch-в-256).
-    const grabPixels = (source: HTMLVideoElement | HTMLImageElement): ImageData => {
-      frameCtx.drawImage(source, 0, 0, INFERENCE_SIZE, INFERENCE_SIZE);
-      return frameCtx.getImageData(0, 0, INFERENCE_SIZE, INFERENCE_SIZE);
-    };
-
     const isUsable = (s: HTMLVideoElement | HTMLImageElement) => {
       const v = s as HTMLVideoElement;
       const i = s as HTMLImageElement;
       if (v.tagName === 'VIDEO') return v.readyState >= 2 && v.videoWidth > 0;
       return i.complete && i.naturalWidth > 0;
     };
-
-    const sendToWorker = (source: HTMLVideoElement | HTMLImageElement) => {
-      const worker = workerRef.current;
-      if (!worker || inFlightRef.current || !isUsable(source)) return;
-      inFlightRef.current = true;
-      frameDirtyRef.current = false; // этот кадр уходит в обработку
-      // Таймстамп = mediaTime кадра (как в Wave 3): MediaPipe VIDEO точнее сглаживает
-      // по времени контента. В фото-режиме mediaTime не растёт -> performance.now().
-      const ts = modeRef.current === 'camera'
-        ? Math.round(mediaTimeRef.current * 1000)
-        : Math.round(performance.now());
-      try {
-        const id = grabPixels(source); // без createImageBitmap (не течёт на iOS)
-        worker.postMessage(
-          { type: 'segment', pixels: id.data.buffer, width: id.width, height: id.height, timestamp: ts },
-          [id.data.buffer],
-        );
-        // watchdog: если ответа нет 1500 мс — снимаем замок, иначе пайплайн залипнет.
-        if (watchdogRef.current) clearTimeout(watchdogRef.current);
-        watchdogRef.current = setTimeout(() => { inFlightRef.current = false; }, 1500);
-      } catch {
-        inFlightRef.current = false;
-      }
-    };
-    sendSegRef.current = sendToWorker; // для coalescing из worker.onmessage
 
     const onFrame = () => {
       const src: HTMLVideoElement | HTMLImageElement =
@@ -412,45 +272,33 @@ export function CameraView() {
       const ip = INTENSITY_PARAMS[intensityRef.current];
       renderer.setIntensity(ip.strength, ip.satScale);
       // LUT отключён: фото-рампы выцветают на свету и оттенок читается неверно.
-      // Используем HSL-метод с насыщенным цветом оттенка (см. шейдер).
       renderer.setLutRow(-1);
       renderer.setMirror(modeRef.current === 'camera');
       // Буфер теперь в аспекте сцены (cover делается в шейдере), поэтому output
       // uv.x == доля сцены: позиция делителя идёт напрямую, без пересчёта аспекта.
       renderer.setSplit(splitRef.current ? splitFracRef.current : -1);
 
-      renderer.render(src);
-      // Регистрируем свежий кадр для latest-wins coalescing и пробуем отправить.
-      latestSourceRef.current = src;
-      frameDirtyRef.current = true;
-      void sendToWorker(src);
-
-      // Кадр в face-воркер (борода) — троттлинг ~4 Гц, инференс полностью вне main.
-      const fw = faceWorkerRef.current;
-      const tNow = performance.now();
-      if (fw && !faceInFlightRef.current && tNow - lastFaceSend >= FACE_DETECT_INTERVAL_MS) {
-        lastFaceSend = tNow;
-        faceInFlightRef.current = true;
-        const fts = modeRef.current === 'camera'
-          ? Math.round(mediaTimeRef.current * 1000)
-          : Math.round(tNow);
-        try {
-          const id = grabPixels(src); // без createImageBitmap (не течёт на iOS)
-          fw.postMessage(
-            { type: 'detect', pixels: id.data.buffer, width: id.width, height: id.height, timestamp: fts },
-            [id.data.buffer],
-          );
-          // watchdog: если воркер не ответит — снимаем замок (борода не вечный приоритет)
-          if (faceWatchdogRef.current) clearTimeout(faceWatchdogRef.current);
-          faceWatchdogRef.current = setTimeout(() => { faceInFlightRef.current = false; }, 2000);
-        } catch {
-          faceInFlightRef.current = false;
-        }
+      // ZERO-READBACK: сегментируем и рендерим В ОДНОМ контексте. Маска приходит
+      // GPU-текстурой в синхронном колбэке segmentForVideo и сразу идёт в шейдер —
+      // никакого CPU-readback, воркера и пересылки. Рендер строго внутри колбэка:
+      // текстура маски валидна только там.
+      const seg = segmenterRef.current;
+      const ts = modeRef.current === 'camera'
+        ? Math.round(mediaTimeRef.current * 1000)
+        : Math.round(performance.now());
+      if (seg) {
+        seg.segment(src, ts, (tex, mw, mh) => {
+          if (tex) {
+            renderer.render(src, { tex, w: mw, h: mh });
+            maskCountRef.current++;
+          } else {
+            renderer.render(src); // маски нет (сбой/смена ступени) — только видео
+          }
+        });
+        backendRef.current = seg.backend;
+      } else {
+        renderer.render(src); // сегментатор ещё не готов — просто видео
       }
-
-      // Этап 1 (exclusion-маска бороды) теперь считается в ОТДЕЛЬНОМ цикле через
-      // requestIdleCallback (см. эффект ниже) — detectForVideo синхронный и тяжёлый,
-      // в рендер-кадре он блокировал отрисовку. Здесь только сам рендер.
 
       frameCount++;
       const now = performance.now();
@@ -459,7 +307,7 @@ export function CameraView() {
         setFps(Math.round(frameCount / secs));
         // Диагностика: бекенд · время инференса · частота масок (Гц).
         const maskHz = Math.round(maskCountRef.current / secs);
-        setDbg(`${backendRef.current || '…'} · inf ${Math.round(infMsRef.current)} rd ${Math.round(readMsRef.current)}ms · ${maskHz}Hz`);
+        setDbg(`${backendRef.current || '…'} · ${maskHz}Hz`);
         maskCountRef.current = 0;
         frameCount = 0;
         fpsT0 = now;
@@ -489,10 +337,6 @@ export function CameraView() {
       cancelAnimationFrame(raf);
     };
   }, []);
-
-  // exclusion-маска бороды теперь считается во ВТОРОМ воркере: кадр отправляется
-  // из onFrame (троттлинг + faceInFlightRef), результат приходит в onmessage
-  // выше. На главном потоке инференса больше нет.
 
   // Общий cleanup при размонтировании: камера, таймер снимка, blob-URL.
   useEffect(() => () => {
@@ -549,7 +393,6 @@ export function CameraView() {
     if (src.startsWith('blob:')) blobUrlRef.current = src;
     img.onload = () => {
       if (myReq !== photoReqRef.current) return; // уже запросили другое фото
-      processorRef.current.reset();
       setMode('image');
     };
     img.onerror = () => {
