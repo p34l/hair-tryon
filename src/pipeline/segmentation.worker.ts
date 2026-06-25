@@ -40,29 +40,35 @@ function post(msg: any, transfer?: Transferable[]) {
 }
 
 async function init(modelUrl: string) {
-  // WebGPU EP (инференс на GPU, ~100мс и быстрее): на мобильном WASM ~300мс — слишком
-  // медленно. Раньше WebGPU ломал маску из-за resize-оп `tf_half_pixel_for_nn`; модель
-  // ПРОПАТЧЕНА (resize -> linear/half_pixel), маска идентична. Фолбэк на WASM где нет WebGPU.
-  // WebGPU EP (GPU, ~100мс; WASM на моб. ~300мс). Гипотеза по «пустой маске»: выход
-  // оставался в GPU-буфере и .data был пуст — теперь явно скачиваем через getData()
-  // в segment(). Фолбэк на WASM где WebGPU нет.
-  const tryEP = (ep: 'webgpu' | 'wasm') =>
-    ort.InferenceSession.create(modelUrl, { executionProviders: [ep], graphOptimizationLevel: 'all' });
+  // WebGPU EP (GPU, ~100мс; WASM на моб. ~300мс), НО с ВАЛИДАЦИЕЙ: создаём сессию,
+  // прогоняем тестовый кадр и проверяем, что выход не пустой и имеет сигнал. Если
+  // WebGPU молча отдаёт пустоту/нули — АВТО-ФОЛБЭК на WASM. Маска рабочая всегда, а
+  // бекенд в HUD честно показывает, завёлся ли WebGPU.
+  const makeValidated = async (ep: 'webgpu' | 'wasm') => {
+    const s = await ort.InferenceSession.create(modelUrl, {
+      executionProviders: [ep], graphOptimizationLevel: 'all',
+    });
+    const inN = s.inputNames[0];
+    const outN = s.outputNames[0];
+    const warm = new ort.Tensor('float32', new Float32Array(SIZE * SIZE * 3), [1, SIZE, SIZE, 3]);
+    const o = await s.run({ [inN]: warm });
+    const ot = o[outN] as any;
+    const d: Float32Array = ot.location && ot.location !== 'cpu' ? await ot.getData(true) : ot.data;
+    if (!d || d.length === 0) throw new Error(`${ep}: empty output`);
+    let mn = d[0], mx = d[0];
+    for (let i = 1; i < d.length; i++) { const v = d[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+    if (mx - mn < 1e-6) throw new Error(`${ep}: flat output`);
+    inputName = inN; outputName = outN;
+    return s;
+  };
   try {
     try {
-      session = await tryEP('webgpu');
+      session = await makeValidated('webgpu');
       backend = 'onnx@webgpu';
     } catch {
-      session = await tryEP('wasm');
+      session = await makeValidated('wasm');
       backend = 'onnx@wasm';
     }
-    inputName = session.inputNames[0] ?? inputName;
-    outputName = session.outputNames[0] ?? outputName;
-    // Прогрев: первый run компилирует кернелы/аллоцирует — на пустом кадре.
-    try {
-      const warm = new ort.Tensor('float32', new Float32Array(SIZE * SIZE * 3), [1, SIZE, SIZE, 3]);
-      await session.run({ [inputName]: warm });
-    } catch { /* прогрев необязателен */ }
     post({ type: 'ready', backend });
   } catch (err) {
     post({ type: 'error', message: 'ORT init: ' + String(err) });
