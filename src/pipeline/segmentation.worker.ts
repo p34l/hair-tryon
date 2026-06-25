@@ -35,25 +35,38 @@ let outputName = 'Identity';
 let inputBuf = new Float32Array(SIZE * SIZE * 3);
 let maskBuf = new Uint8Array(SIZE * SIZE);
 let busy = false;
+let backend = 'onnx';
 
 function post(msg: any, transfer?: Transferable[]) {
   (self as any).postMessage(msg, transfer ?? []);
 }
 
 async function init(modelUrl: string) {
-  try {
-    session = await ort.InferenceSession.create(modelUrl, {
-      executionProviders: ['wasm'],
+  // Сначала WebGPU (инференс на GPU, ~15мс → ~30 Гц маски, держится как в zero-readback),
+  // с фолбэком на WASM (CPU, ~100мс). Это ВСЁ ЕЩЁ ORT — не протекающий MediaPipe.
+  const tryEP = async (ep: 'webgpu' | 'wasm') => {
+    const s = await ort.InferenceSession.create(modelUrl, {
+      executionProviders: [ep],
       graphOptimizationLevel: 'all',
     });
+    return s;
+  };
+  try {
+    try {
+      session = await tryEP('webgpu');
+      backend = 'onnx@webgpu';
+    } catch {
+      session = await tryEP('wasm');
+      backend = 'onnx@wasm';
+    }
     inputName = session.inputNames[0] ?? inputName;
     outputName = session.outputNames[0] ?? outputName;
-    // Прогрев: первый run компилирует/аллоцирует — делаем на пустом кадре.
+    // Прогрев: первый run компилирует кернелы/аллоцирует — на пустом кадре.
     try {
       const warm = new ort.Tensor('float32', new Float32Array(SIZE * SIZE * 3), [1, SIZE, SIZE, 3]);
       await session.run({ [inputName]: warm });
     } catch { /* прогрев необязателен */ }
-    post({ type: 'ready', backend: 'onnx@wasm' });
+    post({ type: 'ready', backend });
   } catch (err) {
     post({ type: 'error', message: 'ORT init: ' + String(err) });
   }
@@ -97,7 +110,7 @@ async function segment(pixels: ArrayBuffer, w: number, h: number) {
 
     const data = maskBuf.slice();
     post(
-      { type: 'mask', data, width: w, height: h, infMs: performance.now() - t0, backend: 'onnx@wasm' },
+      { type: 'mask', data, width: w, height: h, infMs: performance.now() - t0, backend },
       [data.buffer],
     );
   } catch (err) {
