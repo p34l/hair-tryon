@@ -43,16 +43,14 @@ async function init(modelUrl: string) {
   // WebGPU EP (инференс на GPU, ~100мс и быстрее): на мобильном WASM ~300мс — слишком
   // медленно. Раньше WebGPU ломал маску из-за resize-оп `tf_half_pixel_for_nn`; модель
   // ПРОПАТЧЕНА (resize -> linear/half_pixel), маска идентична. Фолбэк на WASM где нет WebGPU.
-  const tryEP = (ep: 'webgpu' | 'wasm') =>
-    ort.InferenceSession.create(modelUrl, { executionProviders: [ep], graphOptimizationLevel: 'all' });
+  // WebGPU EP не завёлся (пустая маска — другой неподдерживаемый оп, отладить без
+  // браузера/GPU нельзя). Остаёмся на WASM: корректно и без утечки, но ~300мс на моб.
   try {
-    try {
-      session = await tryEP('webgpu');
-      backend = 'onnx@webgpu';
-    } catch {
-      session = await tryEP('wasm');
-      backend = 'onnx@wasm';
-    }
+    session = await ort.InferenceSession.create(modelUrl, {
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: 'all',
+    });
+    backend = 'onnx@wasm';
     inputName = session.inputNames[0] ?? inputName;
     outputName = session.outputNames[0] ?? outputName;
     // Прогрев: первый run компилирует кернелы/аллоцирует — на пустом кадре.
