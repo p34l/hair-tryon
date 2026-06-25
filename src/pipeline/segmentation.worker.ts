@@ -42,23 +42,14 @@ function post(msg: any, transfer?: Transferable[]) {
 }
 
 async function init(modelUrl: string) {
-  // Сначала WebGPU (инференс на GPU, ~15мс → ~30 Гц маски, держится как в zero-readback),
-  // с фолбэком на WASM (CPU, ~100мс). Это ВСЁ ЕЩЁ ORT — не протекающий MediaPipe.
-  const tryEP = async (ep: 'webgpu' | 'wasm') => {
-    const s = await ort.InferenceSession.create(modelUrl, {
-      executionProviders: [ep],
+  // WASM EP (CPU+SIMD): корректно обрабатывает resize-оп модели. WebGPU EP его
+  // ломал (маска не ложилась). Скорость добираем квантизацией модели (int8).
+  try {
+    session = await ort.InferenceSession.create(modelUrl, {
+      executionProviders: ['wasm'],
       graphOptimizationLevel: 'all',
     });
-    return s;
-  };
-  try {
-    try {
-      session = await tryEP('webgpu');
-      backend = 'onnx@webgpu';
-    } catch {
-      session = await tryEP('wasm');
-      backend = 'onnx@wasm';
-    }
+    backend = 'onnx@wasm';
     inputName = session.inputNames[0] ?? inputName;
     outputName = session.outputNames[0] ?? outputName;
     // Прогрев: первый run компилирует кернелы/аллоцирует — на пустом кадре.
