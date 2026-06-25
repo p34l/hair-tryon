@@ -93,7 +93,7 @@ export const FEATHER_RADIUS = 2.6;
  * фактический размер вывода × devicePixelRatio с потолком — чтобы шейдер не
  * считал per-pixel на 1080p зря. 1280 — чёткая картинка на high-DPI экранах.
  */
-export const MAX_RENDER_HEIGHT = 960;
+export const MAX_RENDER_HEIGHT = 768;
 
 /**
  * Matting-край (этап 3). Joint-bilateral апсемпл мягкой маски по hi-res видео.

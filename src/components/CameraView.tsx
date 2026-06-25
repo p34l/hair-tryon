@@ -210,7 +210,8 @@ export function CameraView() {
     // (getAsWebGLTexture) и идёт прямо в шейдер — без getAs*Array, без воркера,
     // без пересылки между потоками. Renderer уже создал webgl2-контекст на этом
     // canvas; сегментатор его переиспользует (опция canvas).
-    const segmenter = new HairSegmenter(canvas);
+    // usePixels=IS_IOS: на iOS маску берём пикселями (getAsWebGLTexture там течёт памятью).
+    const segmenter = new HairSegmenter(canvas, IS_IOS);
     segmenterRef.current = segmenter;
     let cancelled = false;
 
@@ -334,10 +335,16 @@ export function CameraView() {
         }
         const tB = performance.now();
         let tC = tB, tD = tB;
-        seg.segment(segSource, ts, (tex, mw, mh) => {
+        seg.segment(segSource, ts, (payload) => {
           tC = performance.now(); // инференс = tC - tB (колбэк синхронный)
-          if (tex) {
-            renderer.render(renderSource, { tex, w: mw, h: mh });
+          if (payload?.tex) {
+            // Android: маска уже GPU-текстура — прямо в шейдер (zero-readback).
+            renderer.render(renderSource, { tex: payload.tex, w: payload.width, h: payload.height });
+            maskCountRef.current++;
+          } else if (payload?.data) {
+            // iOS: маска пикселями — заливаем в свою текстуру, потом обычный рендер.
+            renderer.updateMask(payload.data, payload.width, payload.height);
+            renderer.render(renderSource);
             maskCountRef.current++;
           } else {
             renderer.render(renderSource); // маски нет — только видео
@@ -361,7 +368,7 @@ export function CameraView() {
         setFps(Math.round(frameCount / secs));
         // Диагностика: бекенд · время инференса · частота масок (Гц).
         const maskHz = Math.round(maskCountRef.current / secs);
-        setDbg(`[v9] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
+        setDbg(`[v10] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
         maskCountRef.current = 0;
         frameCount = 0;
         fpsT0 = now;

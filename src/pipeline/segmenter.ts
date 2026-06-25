@@ -21,13 +21,25 @@ export const HAIR_CLASS = 1; // и SelfieMulticlass, и hair_segmenter держ�
 type Delegate = 'GPU' | 'CPU';
 interface Rung { model: string; delegate: Delegate }
 
-/** Колбэк получает текстуру маски (на GPU) + её размеры, либо null если маски нет. */
-export type MaskCallback = (tex: WebGLTexture | null, width: number, height: number) => void;
+/**
+ * Колбэк получает маску одним из двух способов (см. usePixels):
+ *  • tex  — GPU-текстура (Android, zero-readback);
+ *  • data — Uint8Array 0..255 (iOS: getAsWebGLTexture там течёт памятью, поэтому
+ *           читаем пиксели и заливаем в свою постоянную текстуру — без утечки).
+ * null — маски нет (сбой/смена ступени).
+ */
+export type MaskPayload =
+  | { tex: WebGLTexture; data?: undefined; width: number; height: number }
+  | { tex?: undefined; data: Uint8Array; width: number; height: number };
+export type MaskCallback = (payload: MaskPayload | null) => void;
 
 export class HairSegmenter {
   private canvas: HTMLCanvasElement | OffscreenCanvas;
   private segmenter: ImageSegmenter | null = null;
   private fileset: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>> | null = null;
+  // iOS: отдавать маску пикселями (getAsUint8Array), а НЕ getAsWebGLTexture —
+  // последний на iOS течёт GPU-памятью (новая текстура каждый кадр).
+  private usePixels: boolean;
 
   // Лестница фолбэка делегата (тот же краш-фикс, что в воркерной версии):
   //  1) мультиклас @ GPU  — лучшая якість маски (десктоп/iOS, исправные Android);
@@ -39,8 +51,9 @@ export class HairSegmenter {
   private lastTs = -1;
   private _backend = '';
 
-  constructor(canvas: HTMLCanvasElement | OffscreenCanvas) {
+  constructor(canvas: HTMLCanvasElement | OffscreenCanvas, usePixels = false) {
     this.canvas = canvas;
+    this.usePixels = usePixels;
   }
 
   get backend(): string { return this._backend; }
@@ -108,7 +121,7 @@ export class HairSegmenter {
    */
   segment(source: TexImageSource, timestamp: number, cb: MaskCallback): void {
     const seg = this.segmenter;
-    if (!seg) { cb(null, 0, 0); return; }
+    if (!seg) { cb(null); return; }
 
     let ts = timestamp;
     if (ts <= this.lastTs) ts = this.lastTs + 1;
@@ -123,11 +136,15 @@ export class HairSegmenter {
           const masks = result.confidenceMasks;
           const hair = masks && masks[HAIR_CLASS];
           if (hair) {
-            // Текстура остаётся на GPU — никакого getAs*Array (нуль readback).
-            const tex = hair.getAsWebGLTexture();
-            cb(tex, hair.width, hair.height);
+            if (this.usePixels) {
+              // iOS: пиксели (64КБ readback) — БЕЗ getAsWebGLTexture (он там течёт).
+              cb({ data: hair.getAsUint8Array(), width: hair.width, height: hair.height });
+            } else {
+              // Android: текстура остаётся на GPU — нуль readback.
+              cb({ tex: hair.getAsWebGLTexture(), width: hair.width, height: hair.height });
+            }
           } else {
-            cb(null, 0, 0);
+            cb(null);
           }
         } finally {
           result.close();
@@ -135,7 +152,7 @@ export class HairSegmenter {
       });
     } catch {
       // Сбой делегата на реальном кадре — на следующую ступень; этот кадр пропускаем.
-      cb(null, 0, 0);
+      cb(null);
       void this.fallbackNext();
     }
   }
