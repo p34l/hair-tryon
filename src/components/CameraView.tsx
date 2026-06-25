@@ -146,6 +146,9 @@ export function CameraView() {
   const mediaTimeRef = useRef(0); // mediaTime кадра из rVFC для segmentForVideo
   const backendRef = useRef(''); // активная ступень сегментации (multi@GPU / hair@GPU / hair@CPU)
   const maskCountRef = useRef(0); // счётчик масок за текущую секунду (для Hz)
+  const prepMsRef = useRef(0); // EMA: подготовка входа (drawImage+getImageData), мс
+  const infMsRef = useRef(0);  // EMA: инференс (segmentForVideo до колбэка), мс
+  const rendMsRef = useRef(0); // EMA: наш рендер внутри колбэка, мс
 
   const [status, setStatus] = useState<Status>('loading');
   const [errorMsg, setErrorMsg] = useState('');
@@ -301,16 +304,25 @@ export function CameraView() {
       if (seg) {
         // Уменьшаем кадр и отдаём сегментатору CPU-пикселями (ImageData), не GPU-
         // backed канвасом/видео — иначе MediaPipe на iOS течёт памятью (см. выше).
+        const tA = performance.now();
         segCtx.drawImage(src, 0, 0, SEG_SIZE, SEG_SIZE);
         const segPixels = segCtx.getImageData(0, 0, SEG_SIZE, SEG_SIZE);
+        const tB = performance.now();
+        let tC = tB, tD = tB;
         seg.segment(segPixels, ts, (tex, mw, mh) => {
+          tC = performance.now(); // инференс = tC - tB (колбэк синхронный)
           if (tex) {
             renderer.render(src, { tex, w: mw, h: mh });
             maskCountRef.current++;
           } else {
             renderer.render(src); // маски нет (сбой/смена ступени) — только видео
           }
+          tD = performance.now(); // рендер = tD - tC
         });
+        // EMA по стадиям: подготовка входа / инференс / рендер.
+        prepMsRef.current = prepMsRef.current * 0.85 + (tB - tA) * 0.15;
+        infMsRef.current = infMsRef.current * 0.85 + (tC - tB) * 0.15;
+        rendMsRef.current = rendMsRef.current * 0.85 + (tD - tC) * 0.15;
         backendRef.current = seg.backend;
       } else {
         renderer.render(src); // сегментатор ещё не готов — просто видео
@@ -323,7 +335,7 @@ export function CameraView() {
         setFps(Math.round(frameCount / secs));
         // Диагностика: бекенд · время инференса · частота масок (Гц).
         const maskHz = Math.round(maskCountRef.current / secs);
-        setDbg(`${backendRef.current || '…'} · ${maskHz}Hz`);
+        setDbg(`${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
         maskCountRef.current = 0;
         frameCount = 0;
         fpsT0 = now;

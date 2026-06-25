@@ -116,16 +116,22 @@ export class HairSegmenter {
 
     try {
       seg.segmentForVideo(source as unknown as HTMLVideoElement, ts, (result) => {
-        const masks = result.confidenceMasks;
-        const hair = masks && masks[HAIR_CLASS];
-        if (hair) {
-          // Текстура остаётся на GPU — никакого getAs*Array (нуль readback).
-          const tex = hair.getAsWebGLTexture();
-          cb(tex, hair.width, hair.height);
-        } else {
-          cb(null, 0, 0);
+        // try/finally КРИТИЧНО: если cb()->render() кинет в общем GL-контексте,
+        // без finally result.close() не дойдёт и маска (GPU-текстура) утечёт КАЖДЫЙ
+        // такой кадр → FPS падает и не встаёт. close() гарантируем всегда.
+        try {
+          const masks = result.confidenceMasks;
+          const hair = masks && masks[HAIR_CLASS];
+          if (hair) {
+            // Текстура остаётся на GPU — никакого getAs*Array (нуль readback).
+            const tex = hair.getAsWebGLTexture();
+            cb(tex, hair.width, hair.height);
+          } else {
+            cb(null, 0, 0);
+          }
+        } finally {
+          result.close();
         }
-        result.close();
       });
     } catch {
       // Сбой делегата на реальном кадре — на следующую ступень; этот кадр пропускаем.
