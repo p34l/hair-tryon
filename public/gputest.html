@@ -44,11 +44,12 @@ document.getElementById('go').addEventListener('click', async () => {
 });
 
 async function run() {
-  // 1) Перевірка фіч (це Chromium/Android; на iOS Safari MSTP немає).
-  if (typeof MediaStreamTrackProcessor === 'undefined')
-    return fail('No MediaStreamTrackProcessor (need Chromium/Android).');
+  // MSTP є тільки в Chromium (Android). На iOS Safari його немає — там годуємо
+  // сегментатор напряму елементом <video>. Нуль-readback ланцюг ОДНАКОВИЙ:
+  // спільний canvas + getAsWebGLTexture; різниця лише в джерелі кадрів.
+  const hasMSTP = typeof MediaStreamTrackProcessor !== 'undefined';
 
-  // 2) Камера.
+  // 1) Камера.
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: false,
     video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 },
@@ -58,8 +59,15 @@ async function run() {
   const settings = track.getSettings();
   const VW = settings.width || 1280, VH = settings.height || 720;
 
-  // 3) GL-контекст СТВОРЮЄ MediaPipe на нашому canvas (опція canvas).
-  //    Розмір canvas = розмір відео; виводимо cover'ом через CSS.
+  // <video> завжди (потрібен для iOS-шляху і як джерело розмірів).
+  const video = document.createElement('video');
+  video.srcObject = stream; video.muted = true; video.playsInline = true;
+  video.setAttribute('playsinline', ''); video.setAttribute('muted', '');
+  await new Promise((r) => { if (video.readyState >= 2) r();
+    else video.onloadedmetadata = () => r(); });
+  await video.play();
+
+  // 2) GL-контекст СТВОРЮЄ MediaPipe на нашому canvas (опція canvas).
   canvas.width = VW; canvas.height = VH;
   const fileset = await FilesetResolver.forVisionTasks(WASM);
   let delegate = 'GPU';
@@ -79,31 +87,27 @@ async function run() {
     });
   }
 
-  // 4) Беремо ТОЙ САМИЙ GL-контекст, що ним користується MediaPipe.
+  // 3) Беремо ТОЙ САМИЙ GL-контекст, що ним користується MediaPipe.
   const gl = canvas.getContext('webgl2');
   if (!gl) return fail('No webgl2 context on shared canvas.');
   const prog = buildProgram(gl);
   const videoTex = gl.createTexture();
 
-  // 5) Кадри камери як VideoFrame (zero-copy на Chrome).
-  const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
-
+  // Спільний лічильник/HUD для обох шляхів.
+  const path = hasMSTP ? 'VideoFrame(MSTP)' : 'video(rVFC)';
   let ts = 0, frames = 0, t0 = performance.now();
-  let infMs = 0, rdMs = 0, gpuMask = 0, maskHz = 0, maskCount = 0;
+  let infMs = 0, rdMs = 0, gpuMask = 0, maskCount = 0;
 
-  while (true) {
-    const { value: frame, done } = await reader.read();
-    if (done) break;
-
+  // Один кадр: source — VideoFrame (Android) або сам <video> (iOS).
+  const processOne = (source) => {
     const tA = performance.now();
-    // Інференс + у колбеку — нуль-readback візуалізація.
-    segmenter.segmentForVideo(frame, ++ts, (res) => {
+    segmenter.segmentForVideo(source, ++ts, (res) => {
       const tB = performance.now();
       const mask = res.confidenceMasks && res.confidenceMasks[HAIR];
       if (mask) {
         gpuMask = mask.hasWebGLTexture() ? 1 : 0;   // 1 = маска вже на GPU (без readback)
         const maskTex = mask.getAsWebGLTexture();     // лишається на GPU
-        draw(gl, prog, videoTex, frame, maskTex);
+        draw(gl, prog, videoTex, source, maskTex);
         maskCount++;
       }
       const tC = performance.now();
@@ -111,21 +115,38 @@ async function run() {
       rdMs  = rdMs  * 0.85 + (tC - tB) * 0.15;       // getAsWebGLTexture + наш draw
       res.close && res.close();
     });
-    frame.close();
-
     frames++;
     const now = performance.now();
     if (now - t0 >= 500) {
       const secs = (now - t0) / 1000;
-      const fps = Math.round(frames / secs);
-      maskHz = Math.round(maskCount / secs);
       hud.textContent =
-        `FPS ${fps}   mask ${maskHz}Hz\n` +
+        `FPS ${Math.round(frames / secs)}   mask ${Math.round(maskCount / secs)}Hz\n` +
         `delegate ${delegate}   gpuMask ${gpuMask ? 'YES (0 readback)' : 'no'}\n` +
         `inf ${infMs.toFixed(1)}ms   tex+draw ${rdMs.toFixed(1)}ms\n` +
-        `${VW}x${VH}`;
+        `${path}  ${VW}x${VH}`;
       frames = 0; maskCount = 0; t0 = now;
     }
+  };
+
+  if (hasMSTP) {
+    // Android: кадри як VideoFrame (zero-copy).
+    const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+    while (true) {
+      const { value: frame, done } = await reader.read();
+      if (done) break;
+      processOne(frame);
+      frame.close();
+    }
+  } else {
+    // iOS/інші: драйвимо живим <video> через requestVideoFrameCallback (фолбек rAF).
+    const hasRVFC = typeof video.requestVideoFrameCallback === 'function';
+    const loop = () => {
+      processOne(video);
+      if (hasRVFC) video.requestVideoFrameCallback(loop);
+      else requestAnimationFrame(loop);
+    };
+    if (hasRVFC) video.requestVideoFrameCallback(loop);
+    else requestAnimationFrame(loop);
   }
 }
 
