@@ -152,7 +152,6 @@ export function CameraView() {
   const [preset, setPreset] = useState<ColorPreset>(PRESETS[0]);
   const [intensity, setIntensity] = useState<Intensity>('intense');
   const [fps, setFps] = useState(0);
-  const [dbg, setDbg] = useState(''); // диагностическая строка (бекенд · инференс · маски/с)
   const [showDisclaimer, setShowDisclaimer] = useState(true);
   const [showCameraPopup, setShowCameraPopup] = useState(true);
   const [showLegal, setShowLegal] = useState(false);
@@ -313,9 +312,6 @@ export function CameraView() {
       if (now - fpsT0 >= 1000) {
         const secs = (now - fpsT0) / 1000;
         setFps(Math.round(frameCount / secs));
-        // Диагностика: бекенд · время инференса · частота масок (Гц).
-        const maskHz = Math.round(maskCountRef.current / secs);
-        setDbg(`${backendRef.current || '…'} · ${maskHz}Hz`);
         maskCountRef.current = 0;
         frameCount = 0;
         fpsT0 = now;
@@ -573,7 +569,7 @@ export function CameraView() {
       </div>
 
       {/* FPS + диагностика (бекенд · инференс · частота масок) */}
-      <div className="fps">{fps} FPS{dbg ? ` · ${dbg}` : ''}</div>
+      <div className="fps">{fps} FPS</div>
 
       {/* правый рейл: Intense/Pastel по центру (на уровне боковых кнопок слева) */}
       <div className="right-rail">
