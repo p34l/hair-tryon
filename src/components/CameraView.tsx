@@ -28,6 +28,10 @@ const IS_IOS =
   (/iP(hone|ad|od)/.test(navigator.userAgent) ||
     (/Mac/.test(navigator.userAgent) && navigator.maxTouchPoints > 1)); // iPadOS 13+
 
+// ТЕСТ: полностью отключить сегментацию (только видео, без инференса/маски) —
+// чтобы изолировать, в ней ли упор по FPS.
+const DISABLE_SEG = true;
+
 // --- Графические иконки (currentColor) ---
 const IconCamera = () => (
   <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor"
@@ -306,7 +310,7 @@ export function CameraView() {
       const ts = modeRef.current === 'camera'
         ? Math.round(mediaTimeRef.current * 1000)
         : Math.round(performance.now());
-      if (seg) {
+      if (seg && !DISABLE_SEG) {
         const tA = performance.now();
         // Один захват кадра как VideoFrame на оба consumer'а (Android); iOS — ImageData.
         let segSource: TexImageSource;
@@ -354,7 +358,7 @@ export function CameraView() {
         setFps(Math.round(frameCount / secs));
         // Диагностика: бекенд · время инференса · частота масок (Гц).
         const maskHz = Math.round(maskCountRef.current / secs);
-        setDbg(`[v14·halfres] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
+        setDbg(`[v15·NOSEG] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
         maskCountRef.current = 0;
         frameCount = 0;
         fpsT0 = now;
