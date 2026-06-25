@@ -169,6 +169,7 @@ export function CameraView() {
   const [preset, setPreset] = useState<ColorPreset>(PRESETS[0]);
   const [intensity, setIntensity] = useState<Intensity>('intense');
   const [fps, setFps] = useState(0);
+  const [diag, setDiag] = useState(''); // диагностика WebGPU/ORT на экран
   const [dbg, setDbg] = useState(''); // диагностическая строка (бекенд · инференс · маски/с)
   const [showDisclaimer, setShowDisclaimer] = useState(true);
   const [showCameraPopup, setShowCameraPopup] = useState(true);
@@ -234,7 +235,9 @@ export function CameraView() {
     };
     worker.onmessage = (e: MessageEvent<WorkerResponse>) => {
       const msg = e.data;
-      if (msg.type === 'ready') {
+      if ((msg as any).type === 'diag') {
+        setDiag((msg as any).message || ''); // диагностика WebGPU на экран
+      } else if (msg.type === 'ready') {
         setModelReady(true); // модель сегментации загружена -> можно просить камеру
         if ((msg as any).backend) backendRef.current = (msg as any).backend;
       } else if (msg.type === 'error') {
@@ -720,6 +723,16 @@ export function CameraView() {
 
       {/* FPS + диагностика (бекенд · инференс · частота масок) */}
       <div className="fps">{fps} FPS{dbg ? ` · ${dbg}` : ''}</div>
+
+      {/* Диагностика WebGPU/ORT — временный оверлей для отладки «пустой маски». */}
+      {diag && (
+        <div style={{
+          position: 'fixed', top: 0, left: 0, right: 0, zIndex: 9999,
+          background: 'rgba(0,0,0,0.8)', color: '#0f0', font: '10px/1.3 monospace',
+          padding: '6px 8px', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+          maxHeight: '45%', overflow: 'auto',
+        }} onClick={() => setDiag('')}>{diag}</div>
+      )}
 
       {/* правый рейл: Intense/Pastel по центру (на уровне боковых кнопок слева) */}
       <div className="right-rail">

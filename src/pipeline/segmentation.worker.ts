@@ -35,44 +35,59 @@ let maskBuf = new Uint8Array(SIZE * SIZE);
 let busy = false;
 let backend = 'onnx';
 
+// ДИАГНОСТИКА: ORT логирует проблемы WebGPU в console — перехватываем, чтобы
+// показать причину «пустой маски» на экране телефона (без DevTools).
+ort.env.logLevel = 'warning';
+const ortLogs: string[] = [];
+const _warn = console.warn.bind(console);
+const _err = console.error.bind(console);
+console.warn = (...a: any[]) => { ortLogs.push('W ' + a.map(String).join(' ').slice(0, 160)); _warn(...a); };
+console.error = (...a: any[]) => { ortLogs.push('E ' + a.map(String).join(' ').slice(0, 160)); _err(...a); };
+
 function post(msg: any, transfer?: Transferable[]) {
   (self as any).postMessage(msg, transfer ?? []);
 }
 
 async function init(modelUrl: string) {
-  // WebGPU EP (GPU, ~100мс; WASM на моб. ~300мс), НО с ВАЛИДАЦИЕЙ: создаём сессию,
-  // прогоняем тестовый кадр и проверяем, что выход не пустой и имеет сигнал. Если
-  // WebGPU молча отдаёт пустоту/нули — АВТО-ФОЛБЭК на WASM. Маска рабочая всегда, а
-  // бекенд в HUD честно показывает, завёлся ли WebGPU.
-  const makeValidated = async (ep: 'webgpu' | 'wasm') => {
-    const s = await ort.InferenceSession.create(modelUrl, {
-      executionProviders: [ep], graphOptimizationLevel: 'all',
-    });
-    const inN = s.inputNames[0];
-    const outN = s.outputNames[0];
-    const warm = new ort.Tensor('float32', new Float32Array(SIZE * SIZE * 3), [1, SIZE, SIZE, 3]);
-    const o = await s.run({ [inN]: warm });
-    const ot = o[outN] as any;
-    const d: Float32Array = ot.location && ot.location !== 'cpu' ? await ot.getData(true) : ot.data;
-    if (!d || d.length === 0) throw new Error(`${ep}: empty output`);
-    let mn = d[0], mx = d[0];
-    for (let i = 1; i < d.length; i++) { const v = d[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
-    if (mx - mn < 1e-6) throw new Error(`${ep}: flat output`);
-    inputName = inN; outputName = outN;
-    return s;
-  };
+  const diag: string[] = [];
   try {
-    try {
-      session = await makeValidated('webgpu');
-      backend = 'onnx@webgpu';
-    } catch {
-      session = await makeValidated('wasm');
-      backend = 'onnx@wasm';
+    // Пробуем WebGPU и ПОДРОБНО смотрим, что он отдаёт на тестовом кадре.
+    const s = await ort.InferenceSession.create(modelUrl, {
+      executionProviders: ['webgpu'], graphOptimizationLevel: 'all',
+    });
+    inputName = s.inputNames[0]; outputName = s.outputNames[0];
+    diag.push('wgpu session ok; out=' + outputName);
+    const warm = new ort.Tensor('float32', new Float32Array(SIZE * SIZE * 3), [1, SIZE, SIZE, 3]);
+    const o = await s.run({ [inputName]: warm });
+    const ot = o[outputName] as any;
+    diag.push('loc=' + (ot.location || '?') + ' dlen=' + (ot.data ? ot.data.length : 'null'));
+    let d: Float32Array | null = ot.data;
+    if (ot.location && ot.location !== 'cpu') {
+      try { d = (await ot.getData(true)) as Float32Array; diag.push('getData len=' + (d ? d.length : 'null')); }
+      catch (e) { diag.push('getData ERR ' + String(e).slice(0, 120)); d = null; }
     }
-    post({ type: 'ready', backend });
-  } catch (err) {
-    post({ type: 'error', message: 'ORT init: ' + String(err) });
+    if (d && d.length) {
+      let mn = d[0], mx = d[0];
+      for (let i = 1; i < d.length; i++) { const v = d[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+      diag.push('min=' + mn.toFixed(3) + ' max=' + mx.toFixed(3));
+    }
+    session = s; backend = 'onnx@webgpu';
+  } catch (e) {
+    diag.push('wgpu ERR ' + String(e).slice(0, 200));
+    try {
+      session = await ort.InferenceSession.create(modelUrl, {
+        executionProviders: ['wasm'], graphOptimizationLevel: 'all',
+      });
+      inputName = session.inputNames[0]; outputName = session.outputNames[0];
+      backend = 'onnx@wasm';
+    } catch (e2) {
+      post({ type: 'error', message: 'ORT init: ' + String(e2) });
+      return;
+    }
   }
+  // Диагностику + последние логи ORT — на экран (msg.type='diag').
+  post({ type: 'diag', message: diag.join(' | ') + '  ||LOGS|| ' + ortLogs.slice(-8).join(' ;; ') });
+  post({ type: 'ready', backend });
 }
 
 async function segment(pixels: ArrayBuffer, w: number, h: number) {
