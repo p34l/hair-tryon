@@ -258,6 +258,18 @@ export function CameraView() {
       return i.complete && i.naturalWidth > 0;
     };
 
+    // Вход сегментатора — УМЕНЬШЕННЫЙ ПЕРЕИСПОЛЬЗУЕМЫЙ кадр 256², а НЕ живой <video>:
+    //  (1) per-frame upload в MediaPipe крошечный → Android не упирается в GPU;
+    //  (2) на iOS повторный upload БОЛЬШОГО видео в MediaPipe течёт GPU-памятью —
+    //      за ~минуту FPS падает и не встаёт; уменьшенный reused-canvas это лечит.
+    // Геометрия как в рабочей версии: stretch в квадрат; шейдер сэмплит маску по
+    // sampleUv (тот же [0,1] над кадром), поэтому маска совпадает с видео.
+    const SEG_SIZE = 256;
+    const segInput = document.createElement('canvas');
+    segInput.width = SEG_SIZE;
+    segInput.height = SEG_SIZE;
+    const segCtx = segInput.getContext('2d')!;
+
     const onFrame = () => {
       const src: HTMLVideoElement | HTMLImageElement =
         modeRef.current === 'image' && imgRef.current?.complete
@@ -287,7 +299,9 @@ export function CameraView() {
         ? Math.round(mediaTimeRef.current * 1000)
         : Math.round(performance.now());
       if (seg) {
-        seg.segment(src, ts, (tex, mw, mh) => {
+        // Уменьшаем кадр в reused 256²-канвас и его отдаём сегментатору (не live video).
+        segCtx.drawImage(src, 0, 0, SEG_SIZE, SEG_SIZE);
+        seg.segment(segInput, ts, (tex, mw, mh) => {
           if (tex) {
             renderer.render(src, { tex, w: mw, h: mh });
             maskCountRef.current++;
