@@ -21,15 +21,11 @@ const SIZE = 256;
 const HAIR = 1;        // SelfieMulticlass: 0 bg,1 hair,2 body,3 face,4 clothes,5 other
 const CLASSES = 6;
 
-// WASM-бинарь ORT берём со СВОЕГО origin (/ort/): под COEP кросс-доменный CDN
-// был бы заблокирован. Файлы лежат в public/ort (скопированы из node_modules).
+// WASM-бинарь ORT берём со СВОЕГО origin (/ort/). Файлы в public/ort.
 ort.env.wasm.wasmPaths = '/ort/';
-// Многопоточность требует cross-origin isolation (SharedArrayBuffer): включается
-// COOP/COEP-заголовками (см. Caddyfile). Тогда инференс ~2.3× быстрее (95->41мс).
-// Где изоляции нет (старый iOS) — один поток (медленнее, но работает).
-ort.env.wasm.numThreads = (self as any).crossOriginIsolated
-  ? Math.min(4, (navigator as any).hardwareConcurrency || 4)
-  : 1;
+// ОДИН поток: на мобильных многопоточность дала НЕ ускорение, а замедление
+// (inf 95->300мс — накладные на спавн/синхронизацию потоков > выигрыша) и затор.
+ort.env.wasm.numThreads = 1;
 
 let session: ort.InferenceSession | null = null;
 let inputName = 'input_29';

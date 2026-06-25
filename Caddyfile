@@ -2,12 +2,8 @@
 	root * /srv
 	encode gzip
 
-	# Cross-origin isolation: включает SharedArrayBuffer -> многопоточный WASM в ORT
-	# (инференс ~2.3× быстрее). COEP=credentialless (а не require-corp), чтобы кросс-
-	# доменные картинки сватчей (sk-qr.com) грузились без CORP на Chrome/Android и
-	# iOS 17.4+. Где credentialless не поддержан — изоляции нет, ORT в один поток.
-	header Cross-Origin-Opener-Policy "same-origin"
-	header Cross-Origin-Embedder-Policy "credentialless"
+	# (COOP/COEP убраны: многопоточный WASM на мобильных оказался медленнее, а
+	# изоляция рисковала кросс-доменными картинками сватчей.)
 
 	# Хэшированные ассеты (имя содержит хэш) можно кэшировать надолго.
 	@assets path /assets/*
