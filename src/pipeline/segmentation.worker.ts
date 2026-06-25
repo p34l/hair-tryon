@@ -43,14 +43,19 @@ async function init(modelUrl: string) {
   // WebGPU EP (инференс на GPU, ~100мс и быстрее): на мобильном WASM ~300мс — слишком
   // медленно. Раньше WebGPU ломал маску из-за resize-оп `tf_half_pixel_for_nn`; модель
   // ПРОПАТЧЕНА (resize -> linear/half_pixel), маска идентична. Фолбэк на WASM где нет WebGPU.
-  // WebGPU EP не завёлся (пустая маска — другой неподдерживаемый оп, отладить без
-  // браузера/GPU нельзя). Остаёмся на WASM: корректно и без утечки, но ~300мс на моб.
+  // WebGPU EP (GPU, ~100мс; WASM на моб. ~300мс). Гипотеза по «пустой маске»: выход
+  // оставался в GPU-буфере и .data был пуст — теперь явно скачиваем через getData()
+  // в segment(). Фолбэк на WASM где WebGPU нет.
+  const tryEP = (ep: 'webgpu' | 'wasm') =>
+    ort.InferenceSession.create(modelUrl, { executionProviders: [ep], graphOptimizationLevel: 'all' });
   try {
-    session = await ort.InferenceSession.create(modelUrl, {
-      executionProviders: ['wasm'],
-      graphOptimizationLevel: 'all',
-    });
-    backend = 'onnx@wasm';
+    try {
+      session = await tryEP('webgpu');
+      backend = 'onnx@webgpu';
+    } catch {
+      session = await tryEP('wasm');
+      backend = 'onnx@wasm';
+    }
     inputName = session.inputNames[0] ?? inputName;
     outputName = session.outputNames[0] ?? outputName;
     // Прогрев: первый run компилирует кернелы/аллоцирует — на пустом кадре.
@@ -80,7 +85,15 @@ async function segment(pixels: ArrayBuffer, w: number, h: number) {
     }
     const tensor = new ort.Tensor('float32', inputBuf, [1, h, w, 3]);
     const out = await session.run({ [inputName]: tensor });
-    const logits = out[outputName].data as Float32Array; // NHWC: (i*CLASSES + c)
+    // На WebGPU выход может лежать в GPU-буфере — .data пуст. Тогда явно скачиваем
+    // через getData(). На WASM location='cpu' и .data готов.
+    const ot = out[outputName] as any;
+    let logits: Float32Array;
+    if (ot.location && ot.location !== 'cpu') {
+      logits = (await ot.getData(true)) as Float32Array;
+    } else {
+      logits = ot.data as Float32Array;
+    }
 
     if (maskBuf.length !== N) maskBuf = new Uint8Array(N);
     for (let i = 0; i < N; i++) {
