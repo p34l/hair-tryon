@@ -20,6 +20,14 @@ import type { Intensity, ColorPreset } from '../types';
 
 type Status = 'loading' | 'ready' | 'denied' | 'error';
 
+// iOS Safari течёт GPU-памятью на texImage2D из GPU-backed источника (video/canvas),
+// поэтому ТАМ кормим сегментатор CPU-пикселями (ImageData). На Android/прочих утечки
+// нет, а getImageData там СТОПОРИТ GPU (prep ~49мс) — поэтому кормим canvas напрямую.
+const IS_IOS =
+  typeof navigator !== 'undefined' &&
+  (/iP(hone|ad|od)/.test(navigator.userAgent) ||
+    (/Mac/.test(navigator.userAgent) && navigator.maxTouchPoints > 1)); // iPadOS 13+
+
 // --- Графические иконки (currentColor) ---
 const IconCamera = () => (
   <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor"
@@ -306,10 +314,12 @@ export function CameraView() {
         // backed канвасом/видео — иначе MediaPipe на iOS течёт памятью (см. выше).
         const tA = performance.now();
         segCtx.drawImage(src, 0, 0, SEG_SIZE, SEG_SIZE);
-        const segPixels = segCtx.getImageData(0, 0, SEG_SIZE, SEG_SIZE);
+        // Android/прочие — canvas напрямую (без getImageData-стопа GPU); iOS —
+        // CPU-пиксели (ImageData), иначе texImage2D(GPU-источник) течёт памятью.
+        const segSource = IS_IOS ? segCtx.getImageData(0, 0, SEG_SIZE, SEG_SIZE) : segCanvas;
         const tB = performance.now();
         let tC = tB, tD = tB;
-        seg.segment(segPixels, ts, (tex, mw, mh) => {
+        seg.segment(segSource, ts, (tex, mw, mh) => {
           tC = performance.now(); // инференс = tC - tB (колбэк синхронный)
           if (tex) {
             renderer.render(src, { tex, w: mw, h: mh });
