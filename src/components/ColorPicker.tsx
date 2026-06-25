@@ -132,13 +132,15 @@ export const ColorPicker = memo(function ColorPicker({ presets, selectedId, onSe
   // ничего не грузится и не декодируется на лету (нет лагов). Объём фиксирован,
   // т.к. реальные утечки (createImageBitmap/SRGB) уже устранены.
   const preloadRef = useRef<HTMLImageElement[]>([]);
+  // ТЕСТ ПРИЧИНЫ ЛАГА: прелоад ~150 картинок ОТКЛЮЧЁН — проверяем, не он ли держит
+  // память и роняет FPS. Вернуть: раскомментировать тело эффекта.
   useEffect(() => {
-    const imgs: HTMLImageElement[] = [];
-    for (const p of presets) {
-      if (p.swatchImage) { const im = new Image(); im.decoding = 'async'; im.src = p.swatchImage; imgs.push(im); }
-      if (p.image) { const im = new Image(); im.decoding = 'async'; im.src = p.image; imgs.push(im); }
-    }
-    preloadRef.current = imgs;
+    // const imgs: HTMLImageElement[] = [];
+    // for (const p of presets) {
+    //   if (p.swatchImage) { const im = new Image(); im.decoding = 'async'; im.src = p.swatchImage; imgs.push(im); }
+    //   if (p.image) { const im = new Image(); im.decoding = 'async'; im.src = p.image; imgs.push(im); }
+    // }
+    // preloadRef.current = imgs;
     return () => { preloadRef.current = []; };
   }, [presets]);
 
