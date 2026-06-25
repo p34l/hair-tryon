@@ -313,10 +313,16 @@ export function CameraView() {
         // Уменьшаем кадр и отдаём сегментатору CPU-пикселями (ImageData), не GPU-
         // backed канвасом/видео — иначе MediaPipe на iOS течёт памятью (см. выше).
         const tA = performance.now();
-        segCtx.drawImage(src, 0, 0, SEG_SIZE, SEG_SIZE);
-        // Android/прочие — canvas напрямую (без getImageData-стопа GPU); iOS —
-        // CPU-пиксели (ImageData), иначе texImage2D(GPU-источник) течёт памятью.
-        const segSource = IS_IOS ? segCtx.getImageData(0, 0, SEG_SIZE, SEG_SIZE) : segCanvas;
+        // iOS: drawImage->ImageData (CPU-пиксели, против texImage2D-утечки).
+        // Android/прочие: кормим САМ <video> напрямую — без нашего drawImage-захвата
+        // кадра (он стопорит GPU в общем контексте ~49мс). MediaPipe берёт кадр сам.
+        let segSource: TexImageSource;
+        if (IS_IOS) {
+          segCtx.drawImage(src, 0, 0, SEG_SIZE, SEG_SIZE);
+          segSource = segCtx.getImageData(0, 0, SEG_SIZE, SEG_SIZE);
+        } else {
+          segSource = src;
+        }
         const tB = performance.now();
         let tC = tB, tD = tB;
         seg.segment(segSource, ts, (tex, mw, mh) => {
@@ -345,7 +351,7 @@ export function CameraView() {
         setFps(Math.round(frameCount / secs));
         // Диагностика: бекенд · время инференса · частота масок (Гц).
         const maskHz = Math.round(maskCountRef.current / secs);
-        setDbg(`${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
+        setDbg(`[v8] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
         maskCountRef.current = 0;
         frameCount = 0;
         fpsT0 = now;
