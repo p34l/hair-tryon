@@ -97,14 +97,17 @@ vec3 oklabToLin(vec3 lab) {
 // переходу волосы→кожа и идёт вдоль прядей: hair-цветные соседи тянут маску
 // вверх на волосах, кожа-цветные исключаются на коже. 5x5 для плавности края,
 // один проход без доп. фреймбуферов.
-// 5x5 joint-bilateral — мягкий край вдоль прядей; вес по цвету отсекает кожу.
+// 3x3 joint-bilateral — мягкий край вдоль прядей; вес по цвету отсекает кожу.
+// 3x3 (а не 5x5): 18 выборок текстур на пиксель вместо 50 — это главный фрагментный
+// расход при полном разрешении. Край чуть менее «вылизанный», но на телефонах это
+// крупный выигрыш по GPU-времени (FPS). Шаг чуть шире, чтобы охват края сохранился.
 float guidedMask(highp vec2 uv, vec3 centerColor) {
   if (u_feather <= 0.01) return texture(u_mask, uv).r;
-  highp vec2 step = u_maskTexel * u_feather;
+  highp vec2 step = u_maskTexel * u_feather * 1.5;
   float sum = 0.0;
   float wsum = 0.0;
-  for (int y = -2; y <= 2; y++) {
-    for (int x = -2; x <= 2; x++) {
+  for (int y = -1; y <= 1; y++) {
+    for (int x = -1; x <= 1; x++) {
       highp vec2 o = vec2(float(x), float(y)) * step;
       float m = texture(u_mask, uv + o).r;
       vec3 c = texture(u_video, uv + o).rgb;
