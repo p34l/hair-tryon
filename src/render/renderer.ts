@@ -356,15 +356,17 @@ export class Renderer {
    * восстанавливаем наш стейт — иначе рисуется чёрное/мусор.
    */
   render(
-    source: HTMLVideoElement | HTMLImageElement,
+    source: HTMLVideoElement | HTMLImageElement | VideoFrame,
     ext?: { tex: WebGLTexture; w: number; h: number },
   ) {
     if (this.contextLost) return;
     const gl = this.gl;
     const v = source as HTMLVideoElement;
     const i = source as HTMLImageElement;
-    const w = v.videoWidth || i.naturalWidth || 0;
-    const h = v.videoHeight || i.naturalHeight || 0;
+    const f = source as VideoFrame;
+    // VideoFrame (Android zero-copy путь): размеры из displayWidth/Height.
+    const w = v.videoWidth || i.naturalWidth || f.displayWidth || 0;
+    const h = v.videoHeight || i.naturalHeight || f.displayHeight || 0;
     if (!w || !h) return;
 
     // --- Восстановление нашего GL-стейта после MediaPipe (общий контекст) ---

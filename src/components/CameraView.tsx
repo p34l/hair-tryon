@@ -313,13 +313,22 @@ export function CameraView() {
         // Уменьшаем кадр и отдаём сегментатору CPU-пикселями (ImageData), не GPU-
         // backed канвасом/видео — иначе MediaPipe на iOS течёт памятью (см. выше).
         const tA = performance.now();
-        // iOS: drawImage->ImageData (CPU-пиксели, против texImage2D-утечки).
-        // Android/прочие: кормим САМ <video> напрямую — без нашего drawImage-захвата
-        // кадра (он стопорит GPU в общем контексте ~49мс). MediaPipe берёт кадр сам.
+        // Источник кадра. Главное — захватить видеокадр ОДИН раз и отдать его и
+        // сегментатору, и рендеру (иначе двойной захват = два GPU-стопа, prep+rend):
+        //  • Android/прочие: один VideoFrame (zero-copy, WebCodecs) → оба аплоадят
+        //    из одной GPU-копии.
+        //  • iOS: VideoFrame/MSTP нет, плюс там утечка от GPU-источников — поэтому
+        //    сегментатору ImageData (CPU), рендеру — само <video>.
         let segSource: TexImageSource;
+        let renderSource: HTMLVideoElement | HTMLImageElement | VideoFrame = src;
+        let vf: VideoFrame | null = null;
         if (IS_IOS) {
           segCtx.drawImage(src, 0, 0, SEG_SIZE, SEG_SIZE);
           segSource = segCtx.getImageData(0, 0, SEG_SIZE, SEG_SIZE);
+        } else if (typeof VideoFrame !== 'undefined' && src instanceof HTMLVideoElement) {
+          vf = new VideoFrame(src, { timestamp: ts });
+          segSource = vf;
+          renderSource = vf;
         } else {
           segSource = src;
         }
@@ -328,13 +337,14 @@ export function CameraView() {
         seg.segment(segSource, ts, (tex, mw, mh) => {
           tC = performance.now(); // инференс = tC - tB (колбэк синхронный)
           if (tex) {
-            renderer.render(src, { tex, w: mw, h: mh });
+            renderer.render(renderSource, { tex, w: mw, h: mh });
             maskCountRef.current++;
           } else {
-            renderer.render(src); // маски нет (сбой/смена ступени) — только видео
+            renderer.render(renderSource); // маски нет — только видео
           }
           tD = performance.now(); // рендер = tD - tC
         });
+        vf?.close(); // освобождаем VideoFrame сразу после синхронного рендера
         // EMA по стадиям: подготовка входа / инференс / рендер.
         prepMsRef.current = prepMsRef.current * 0.85 + (tB - tA) * 0.15;
         infMsRef.current = infMsRef.current * 0.85 + (tC - tB) * 0.15;
@@ -351,7 +361,7 @@ export function CameraView() {
         setFps(Math.round(frameCount / secs));
         // Диагностика: бекенд · время инференса · частота масок (Гц).
         const maskHz = Math.round(maskCountRef.current / secs);
-        setDbg(`[v8] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
+        setDbg(`[v9] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
         maskCountRef.current = 0;
         frameCount = 0;
         fpsT0 = now;
