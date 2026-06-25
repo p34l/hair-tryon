@@ -34,8 +34,8 @@ export const MODEL = {
   // Локально из /public нельзя: MediaPipe грузит loader через dynamic import(),
   // а Vite не отдаёт /public-файлы как модули в dev.
   // ВАЖНО: версия WASM ДОЛЖНА совпадать с npm-версией @mediapipe/tasks-vision,
-  // иначе "ModuleFactory not set". Тестируем 0.10.36-rc на предмет iOS-утечки памяти.
-  wasmRoot: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.36-rc.20260617/wasm',
+  // иначе "ModuleFactory not set". 0.10.36-rc iOS-утечку НЕ исправил — вернулись на 0.10.35.
+  wasmRoot: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm',
 } as const;
 
 /**

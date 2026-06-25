@@ -368,7 +368,7 @@ export function CameraView() {
         setFps(Math.round(frameCount / secs));
         // Диагностика: бекенд · время инференса · частота масок (Гц).
         const maskHz = Math.round(maskCountRef.current / secs);
-        setDbg(`[v11·mp0.10.36] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
+        setDbg(`[v12] ${backendRef.current || '…'} ${maskHz}Hz · prep ${Math.round(prepMsRef.current)} inf ${Math.round(infMsRef.current)} rend ${Math.round(rendMsRef.current)}ms`);
         maskCountRef.current = 0;
         frameCount = 0;
         fpsT0 = now;

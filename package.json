@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@mediapipe/tasks-vision": "^0.10.36-rc.20260617",
+    "@mediapipe/tasks-vision": "^0.10.35",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "swiper": "^11.2.10"
